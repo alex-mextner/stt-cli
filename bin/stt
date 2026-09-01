@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# Thin shim for the symlink install path (install.sh symlinks this into a bin dir; the
+# symlink must resolve back to the repo to find the stt_cli package). uv/pipx installs use
+# [project.scripts] stt = "stt_cli.cli:main" and never run this file. Keep it MINIMAL:
+# every line here executes before any check, with the user's rights, from a file a
+# ~/.local/bin symlink points at — minimal surface.
+import os
+import sys
+
+# Follow the symlink to the real repo root and add it to sys.path ONLY when the sibling
+# package is actually present there. Never insert blindly and never the cwd: sys.path[0]
+# precedes stdlib for pure-python modules, so a stray stt_cli/ would otherwise shadow the
+# real one.
+_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if os.path.isfile(os.path.join(_root, "stt_cli", "__init__.py")):
+    sys.path.insert(0, _root)
+
+from stt_cli.cli import main  # noqa: E402
+
+raise SystemExit(main())

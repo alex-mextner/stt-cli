@@ -1,0 +1,70 @@
+# Merge gate: block the PR while its body has UNCHECKED task-list boxes (`- [ ]`).
+#
+# GitHub has no built-in "require every PR checkbox ticked" gate. This parses the PR body
+# and fails if any unchecked `- [ ]` remains — handy for an acceptance-criteria checklist
+# in your PR template (see pull_request_template.md alongside this slot).
+#
+# INSTALL: copy BOTH files into your repo:
+#   ci/pr-checklist/workflow.yml         -> .github/workflows/pr-checklist.yml
+#   ci/pr-checklist/checklist-gate.mjs   -> .github/scripts/checklist-gate.mjs
+# (The workflow imports the parser by path; keep them in sync. Optionally also copy
+#  checklist-gate.test.mjs and run it in CI so a green test proves the gate logic.)
+# To HARD-block: Settings -> Branches -> required checks -> add "PR Checklist" (admin-only).
+#
+# TAMPER-RESISTANCE — why `pull_request_target`:
+#   The workflow file AND the checked-out parser both come from the BASE branch (trusted),
+#   never the PR head — so a PR that edits this workflow or the parser is still evaluated by
+#   the trusted base version. This is the secure form of "run with repo context on a PR".
+#
+#   HARD SAFETY RULE for pull_request_target: the job runs with a WRITE-scoped token and
+#   base-branch context, so it MUST NEVER check out or execute PR-head code. This workflow
+#   doesn't: the only checkout uses the default ref (base), and the only input is the PR
+#   body from the event payload (never the PR's files/scripts, never string-interpolated
+#   into a shell). `permissions: contents: read` keeps the token minimal as belt-and-braces.
+#
+# Caveat: because it runs from base, it does NOT run on the PR that first introduces it
+# (base has no gate yet) — it goes live from the next PR.
+
+name: PR Checklist
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  checklist:
+    name: PR Checklist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (base branch — default ref under pull_request_target)
+        # No `ref:` — under pull_request_target the default checkout is the BASE branch
+        # (trusted), NOT the PR head. Do NOT set `ref: ...head.sha`: that would run
+        # PR-controlled parser code and defeat the whole point of this trigger.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify all task-list checkboxes are checked
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            // Import the SAME parser the self-check test exercises (a green test proves
+            // this gate's logic — no duplicated regex). Under pull_request_target the
+            // workspace holds the BASE (trusted) version, so the PR cannot tamper with it.
+            const { parseUnchecked } = await import(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/checklist-gate.mjs`
+            )
+            // context.payload — the PR body from the event payload, never the PR's
+            // checked-out files, and never string-interpolated into the script, so a
+            // malicious PR body cannot inject shell/JS and no PR code is executed.
+            const body = context.payload.pull_request?.body ?? ''
+            const unchecked = parseUnchecked(body)
+            if (unchecked.length > 0) {
+              core.setFailed(
+                'Unchecked task-list items remain — all must be checked before merge:\n' +
+                  unchecked.map((l) => `  • ${l}`).join('\n'),
+              )
+              return
+            }
+            core.info('All task-list checkboxes are checked (or none present). ✓')

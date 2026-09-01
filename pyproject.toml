@@ -47,7 +47,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["B008"]
+# RUF001/002/003 flag "ambiguous" Cyrillic characters. This is a transcription tool: the
+# hallucination phrase list, the tests and the prompts are DELIBERATELY multilingual, and
+# every Cyrillic character in them is data, not a mistyped Latin one.
+ignore = ["B008", "RUF001", "RUF002", "RUF003"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

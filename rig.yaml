@@ -1,0 +1,136 @@
+# yaml-language-server: $schema=schema/rig.schema.json
+# rig.yaml — declarative development policy for this repository. COMMITTED BY DEFAULT.
+# Source of truth: global defaults in ~/.config/rig/config.yaml, then this file overrides them.
+# Rig manages lint/format, CI, git/agent hooks, skills, MCP, harness permissions, GitHub settings, tools, and more.
+# Inspect before changing: `rig status`; lint policy: `rig lint rules`; all option semantics: docs/config-schema.md.
+# Safe edit: `rig config set <dot.path> <value>` previews config + reconcile impact without writing.
+# Commit intentionally with `rig config set <dot.path> <value> --commit`; converge manual edits with `rig apply commit`.
+# Generated/carried target files are outputs; make durable policy changes here or in the global layer.
+
+version: 1
+defaults:
+  skills_target: ~/.agents/skills
+  hooks_target: ~/.claude/hooks
+  ci_target: .github/workflows
+  mcp_target: ~/.claude/mcp
+  on_conflict: backup
+stack: backend/python
+skills:
+  enabled: true
+  target: ~/.agents/skills
+  universal:
+    all: true
+    disable: []
+  by_type:
+    enable:
+    - cli
+agent_hooks:
+  enabled: true
+  target: ~/.claude/hooks
+  all: true
+git_hooks:
+  dispatcher:
+    enabled: true
+    dir: ~/.config/git/global-hooks.d
+    runner: ~/.config/git/run-global-hooks
+    set_global_hooks_path: true
+    install_local_retrofit_script: true
+    fragments:
+      secret-scan:
+        enabled: true
+ci:
+  enabled: true
+  target: .github/workflows
+  all: false
+  items:
+    secret-scan:
+      enabled: true
+      tier: block
+    codeql:
+      enabled: true
+      tier: block
+      variant: selfgate
+    dependency-review:
+      enabled: true
+      tier: block
+    leftover-grep:
+      enabled: true
+      tier: block
+    review-threads:
+      enabled: true
+      tier: block
+    pr-checklist:
+      enabled: true
+      tier: block
+    ship:
+      enabled: true
+      install_to: ~/bin
+      gh_alias: true
+mcp:
+  enabled: true
+  target: ~/.claude/mcp
+  items: {}
+harness:
+  enabled: true
+  kind: claude-code
+  auto_mode: true
+models:
+  enabled: true
+  schedule:
+    time: '12:00'
+github:
+  ruleset:
+    enabled: true
+    name: rig-managed
+    require_pull_request: true
+    required_reviews: 0
+    required_conversation_resolution: true
+    dismiss_stale_reviews: true
+    block_force_push: true
+    restrict_deletion: true
+    require_linear_history: false
+    require_signatures: false
+    admin_bypass: true
+  merge:
+    enabled: true
+    squash_merge: true
+    merge_commit: false
+    rebase_merge: false
+    delete_branch_on_merge: true
+    allow_auto_merge: true
+    allow_update_branch: true
+  ghas:
+    enabled: true
+    vulnerability_alerts: true
+    automated_security_fixes: true
+    secret_scanning: true
+    secret_scanning_push_protection: true
+    code_scanning_default_setup: true
+  actions:
+    enabled: true
+    actions_enabled: true
+    allowed_actions: all
+    default_workflow_permissions: read
+    can_approve_pull_request_reviews: false
+  browser:
+    enabled: true
+    discussions: false
+    projects: true
+project_tools:
+  enabled: true
+  haft:
+    enabled: true
+    codex_mcp: true
+    workflow:
+      mode: standard
+      require_decision: true
+      require_verify: true
+      allow_autonomy: false
+  serena:
+    enabled: true
+    read_only: false
+    ignored_paths: []
+  sverklo:
+    enabled: true
+    register: true
+    reindex: false

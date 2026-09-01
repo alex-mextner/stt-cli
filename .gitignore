@@ -8,3 +8,11 @@ __pycache__/
 build/
 dist/
 .DS_Store
+
+# Machine-local tooling state written by `rig apply`. It embeds absolute paths from the
+# machine that generated it, so committing it breaks every other checkout (and the sibling
+# CLIs keep it untracked for the same reason). Re-create it with `rig apply commit`.
+.claude/
+.codex/
+.haft/
+.serena/

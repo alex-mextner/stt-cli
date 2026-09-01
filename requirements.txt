@@ -1,0 +1,43 @@
+# Pinned development dependencies — the ONLY Python packages this project has.
+#
+# stt-cli itself declares zero runtime dependencies on purpose (the engine is a native
+# binary and every media operation shells out to ffmpeg), so there is nothing to pin for
+# users. This file exists for two reasons:
+#
+#   1. The dependency-audit CI gate scans a pinned `requirements*.txt` as DATA. Given only a
+#      `pyproject.toml` it cannot audit anything without building the project, so it fails
+#      closed — correctly, but permanently. This gives it something real to check.
+#   2. It pins the exact linter, type-checker and test-runner versions CI uses, so a tool
+#      release cannot turn a green branch red overnight.
+#
+# Regenerate after changing the dev/test extras:
+#   uv pip compile --extra dev --extra test -o requirements.txt pyproject.toml
+#
+ast-serialize==0.8.0
+    # via mypy
+iniconfig==2.3.0
+    # via pytest
+librt==0.15.0
+    # via mypy
+mypy==2.3.1
+    # via stt-cli (pyproject.toml)
+mypy-extensions==1.1.0
+    # via mypy
+packaging==26.3
+    # via pytest
+pathspec==1.1.1
+    # via mypy
+pluggy==1.6.0
+    # via pytest
+pygments==2.21.0
+    # via pytest
+pytest==9.1.1
+    # via
+    #   stt-cli (pyproject.toml)
+    #   pytest-asyncio
+pytest-asyncio==1.4.0
+    # via stt-cli (pyproject.toml)
+ruff==0.16.5
+    # via stt-cli (pyproject.toml)
+typing-extensions==4.16.0
+    # via mypy

@@ -1,0 +1,49 @@
+name: tests
+
+# The suite deliberately needs no model, no GPU, no ffmpeg and no network: everything that
+# would require one is either a pure function or mocked. That is what makes it runnable on
+# a plain Linux runner even though the tool itself only targets macOS.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python }} --extra dev ruff check .
+
+      - name: Format check
+        run: uv run --python ${{ matrix.python }} --extra dev ruff format --check .
+
+      - name: Type check
+        run: uv run --python ${{ matrix.python }} --extra dev mypy stt_cli
+
+      - name: Tests
+        run: uv run --python ${{ matrix.python }} --extra test pytest -q
+
+      - name: CLI starts with no engine, no ffmpeg and no models installed
+        # The whole point of the import-clean rule: help and version must work on a bare box.
+        run: |
+          uv run --python ${{ matrix.python }} python -m stt_cli.cli --help
+          uv run --python ${{ matrix.python }} python -m stt_cli.cli --version
