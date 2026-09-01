@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stt-cli"
+dynamic = ["version"]
+description = "Speech-to-text for any audio/video file on macOS: VAD-gated transcription, hallucination and loop scrubbing, decoding variants with confidence, optional LLM correction and speaker diarization, all cached in a local content-addressed archive."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Alex Mextner" }]
+keywords = ["speech-to-text", "whisper", "transcription", "asr", "macos", "diarization", "vad"]
+
+# ZERO required third-party runtime deps. The default engine is the whisper.cpp binary
+# (or mlx-whisper, installed into its own uv-managed environment on demand) and every
+# media operation shells out to ffmpeg/ffprobe. Everything else is stdlib, so the tool
+# installs in seconds and a broken optional extra can never break the core path.
+dependencies = []
+
+[project.optional-dependencies]
+# The MLX engine. Optional because whisper.cpp users never need it, and because it is
+# Apple-Silicon-only. `stt setup` installs it on demand.
+mlx = ["mlx-whisper>=0.4"]
+# Speaker diarization. Heavy (torch + pyannote, ~2.5 GB) and gated behind a Hugging Face
+# token, so it is NEVER a default install: `stt diarize install` pulls it when asked.
+diarize = ["pyannote.audio>=3.1", "torch>=2.2"]
+test = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
+
+[project.scripts]
+stt = "stt_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alex-mextner/stt-cli"
+Issues = "https://github.com/alex-mextner/stt-cli/issues"
+
+[tool.setuptools.packages.find]
+include = ["stt_cli*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "stt_cli.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+# Optional engines are imported lazily and are not installed in the type-check env.
+[[tool.mypy.overrides]]
+module = ["mlx_whisper.*", "pyannote.*", "torch.*"]
+ignore_missing_imports = true
