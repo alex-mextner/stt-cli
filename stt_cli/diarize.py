@@ -32,8 +32,8 @@ PIPELINE = "pyannote/speaker-diarization-3.1"
 INSTALL_SIZE_GIB = 2.5
 
 INSTALL_HINT = (
-    "run `stt diarize install` (downloads pyannote.audio + torch, about 2.5 GB), then accept "
-    f"the model terms at https://hf.co/{PIPELINE} and set HF_TOKEN"
+    "run `stt diarize install` (downloads pyannote.audio + torch, about 2.5 GB), then "
+    "`stt login diarization` to get a Hugging Face token and accept the model terms"
 )
 
 
@@ -70,19 +70,20 @@ def _python() -> str:
 
 
 def require_token() -> str:
-    """The Hugging Face token the gated pipeline needs, with a real explanation if missing."""
-    import os
+    """The Hugging Face token the gated pipeline needs, with a real way out if it is missing.
 
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    The lookup lives in :mod:`stt_cli.hf` so that this and ``stt login`` can never disagree
+    about which token is in force.
+    """
+    from . import hf
+
+    token = hf.read_token()
     if token:
         return token
     raise PermissionDeniedError(
         what="speaker diarization needs a Hugging Face token",
-        why=f"{PIPELINE} is a gated model and no HF_TOKEN is set in the environment",
-        how=(
-            f"accept the terms at https://hf.co/{PIPELINE}, create a token at "
-            "https://hf.co/settings/tokens, then `export HF_TOKEN=hf_...`"
-        ),
+        why=f"{PIPELINE} is a gated model and no token is stored or exported",
+        how="run `stt login diarization` — it opens the pages and stores the token for you",
     )
 
 

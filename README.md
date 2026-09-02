@@ -59,7 +59,7 @@ not want the first time, re-renders from the archive in milliseconds. `stt archi
 | `md` | a document: source metadata, summary if present, transcript |
 | `json` | everything — segments, per-segment confidence, alternatives, flags |
 | `srt` `vtt` | subtitles |
-| `csv` `tsv` | one row per segment, for a spreadsheet |
+| `csv` `tsv` | one row per segment, for a spreadsheet (read it by column NAME — columns get added) |
 | `speakers` | dialogue, one block per speaker turn |
 | `summary` | the structured summary on its own |
 
@@ -119,16 +119,96 @@ speech model was unsure. Enabling `--fix` therefore gathers variants automatical
 or not you asked to see them. The speech model's original wording is always kept as a
 variant, so `--text raw` gets it back without re-running anything.
 
+## Terminology
+
+The speech model knows the language; it does not know your product, your colleagues or your
+codebase. One five-minute recording produced ConLoca, Conloca, ConLog and ConLoka for a
+single project name, and "Vigma" for Figma. A dictionary fixes that:
+
+```bash
+stt dict add ConLoca --aka ConLog --aka Coloca --note "the open-source project"
+stt dict add Figma --aka Vigma
+stt dict import glossary.txt      # "Term = alias, alias  # note", one per line
+stt dict check "we keep making Colocka good"   # what would be flagged, and how strongly
+```
+
+It is used in three places, because each one catches what the others cannot:
+
+1. **In the speech model's prompt**, before decoding. This is the only one that can fix a
+   word the model got wrong acoustically. Measured on a real recording: with the glossary
+   carried, "Vigma" came back as "Figma" and three of four project-name mentions came back
+   spelled correctly.
+2. **As an exact correction** for the spellings you recorded under `--aka`, and as a *flag*
+   for words that merely sound like a term. The distinction is deliberate: a spelling you
+   wrote down is a fact, a phonetic near-match is a suspicion, and suspicions do not
+   silently rewrite your transcript.
+3. **In the LLM correction prompt**, with the flagged candidates attached, so the pass that
+   can read the sentence decides which suspicions the sentence supports.
+
+The phonetic matcher is home-grown on purpose: Soundex and Metaphone are built for English
+orthography and do not accept Cyrillic at all, and these recordings switch language
+mid-sentence. `--dict-similarity` moves the threshold; `stt dict check` shows the scores.
+
 ## Speakers
 
 ```bash
-stt diarize install         # ~2.5 GB, only when you want it
+stt diarize install              # ~2.5 GB, only when you want it
+stt login diarization            # opens the browser, gets the token, accepts the terms
 stt rec.m4a --diarize -f speakers
 ```
 
-Speaker diarization uses `pyannote.audio`, which means PyTorch and a gated Hugging Face
-model. It is not installed by default and never downloads anything without telling you the
+Speaker diarization uses `pyannote.audio`, which means PyTorch and two gated Hugging Face
+models. It is not installed by default and never downloads anything without telling you the
 size first.
+
+`stt login diarization` is the whole credential dance in one command. It opens the token
+page, watches the clipboard so that clicking **Copy** in the browser is all you have to do,
+verifies the token against the Hugging Face API, stores it in the file `huggingface_hub`
+itself reads (`~/.cache/huggingface/token`, mode 600 — so `HF_TOKEN` never has to live in
+your shell profile), then checks both gated models and reopens the page of any whose terms
+you have not accepted yet. `stt login --status` reports without changing anything, and
+`stt logout` removes the stored token.
+
+```
+stt login [capability] [--provider NAME] [--status] [--no-browser] [--force]
+```
+
+Piping works too, for a machine with no browser: `echo hf_... | stt login diarization`.
+
+## Context, loops and the second opinion
+
+Whisper feeds its own previous output back into the next 30-second window. That keeps
+casing, punctuation and proper nouns consistent across window boundaries — and it is
+exactly what lets a repetition loop feed itself, because a garbage phrase in the prompt
+makes more of the same garbage the likeliest continuation. stt decodes with that turned off
+by default (`--context off`), which is why the loops stopped.
+
+The quality it costs is real, so you can buy it back without the risk:
+
+```bash
+stt rec.m4a --context-compare always --show-variants   # decode twice, keep both readings
+stt rec.m4a --fix                                      # implies --context-compare auto
+```
+
+The comparison decodes a second time with context on and attaches every disagreement to the
+primary segment as a variant. The context-free pass stays primary, so a loop can never win
+by default; the LLM correction pass sees both readings with their confidences and chooses
+per segment. `auto` — which `--fix` turns on by itself — re-decodes only the chunks that
+look damaged (one opening in lower case, or full of shaky segments) instead of the whole
+recording.
+
+One caveat, and it belongs exactly where the feature is most used. On whisper.cpp a pinned
+glossary only works if the decoder is given a context budget — with `-mc 0` the initial
+prompt has no effect at all — so a run with a dictionary buys itself 64 tokens. The primary
+pass therefore does carry a little of its own output on that engine, and the loop safety
+above is bounded rather than absolute for `stt rec.m4a --fix` with terms in the dictionary.
+It is bounded because the glossary is pinned as a static prefix and only what is left of the
+64 can hold carried-back text; `--no-dict-bias` keeps `--context off` literal if you would
+rather have the guarantee than the terminology. mlx-whisper pins the prompt for free and is
+unaffected. A run with no comparison pass is stored as `short` rather than `off`, so the
+archive says what was actually decoded; with the comparison on (which is what `--fix` turns
+on) it stays `off`, because the two modes then differ in what the second pass decodes
+against and collapsing them would serve one for the other.
 
 ## Archive
 

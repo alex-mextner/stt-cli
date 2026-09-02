@@ -33,19 +33,24 @@ def run(argv: list[str]) -> int:
 
 
 def _status() -> int:
+    """Both halves of "can I diarize right now": the wheels, and the credential."""
+    from .. import auth
+
     installed = diarize_mod.is_installed()
     print(f"pyannote.audio: {'installed' if installed else 'not installed'}")
     if not installed:
         print(f"  fix: {diarize_mod.INSTALL_HINT}")
         return EXIT_MISSING_DEP
-    try:
-        diarize_mod.require_token()
-    except Exception as exc:
-        print(f"Hugging Face token: missing\n  {getattr(exc, 'how', '')}")
-        return EXIT_PERMISSION
-    print("Hugging Face token: present")
-    print(f"pipeline: {diarize_mod.PIPELINE}")
-    print("\nready — add --diarize to a transcription, or -f speakers for a dialogue transcript")
+    signed_in = auth.status("diarization", "hf")
+    print(signed_in.render())
+    if not signed_in.ok:
+        # The status decides its own code. This caller used to throw the distinction away —
+        # a network blip while a perfectly good token sits on disk is not a credential
+        # failure, and automation retrying login on EXIT_PERMISSION would do it for nothing
+        # — and then used to answer it with a copy of `auth.report`'s mapping.
+        return signed_in.exit_code()
+    print(f"\npipeline: {diarize_mod.PIPELINE}")
+    print("ready — add --diarize to a transcription, or -f speakers for a dialogue transcript")
     return EXIT_OK
 
 
@@ -71,8 +76,20 @@ def _install(*, assume_yes: bool) -> int:
     if result.returncode != 0:
         print("install failed — see the output above", file=sys.stderr)
         return EXIT_MISSING_DEP
-    print(
-        f"\ninstalled. One more step: accept the model terms at "
-        f"https://hf.co/{diarize_mod.PIPELINE} and export HF_TOKEN=hf_..."
-    )
-    return _status()
+    print("\ninstalled. One step left: the models are gated, so stt needs a token.")
+    return _login_now()
+
+
+def _login_now() -> int:
+    """Chain straight into the browser flow rather than printing homework.
+
+    Only when there is somebody there to click. `stt diarize install -y` in a script must
+    not open a browser and then block for five minutes waiting for a token that nobody is
+    going to copy, so a non-interactive install says what is left to do and stops.
+    """
+    from .. import auth
+
+    if not sys.stdin.isatty():
+        print("run `stt login diarization` from a terminal to finish setting it up")
+        return EXIT_PERMISSION
+    return auth.report(auth.login("diarization", "hf"))

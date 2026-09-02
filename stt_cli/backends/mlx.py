@@ -22,13 +22,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from .. import proc, registry
 from .._errors import EngineError
-from ..jsonio import JsonDict, as_dict, as_dicts, as_float, as_opt_float, as_str
+from ..jsonio import JsonDict, as_dict, as_dicts, as_float, as_list, as_opt_float, as_str
 from ..models import Segment, Word
-from .base import Availability, DecodeRequest, VadProvider, confidence_from_logprob
+from .base import Availability, DecodeRequest, VadProvider, confidence_from_logprob, warn_once
 
 NAME = "mlx"
 WORKER = Path(__file__).with_name("mlx_worker.py")
@@ -38,6 +39,17 @@ INSTALL_HINT = (
 )
 
 
+# The token budget `--context full` asks for; mlx cannot express anything smaller.
+FULL_CONTEXT = 224
+
+# Importing mlx_whisper is the slow part of the probe; a model is never loaded.
+_PROBE_TIMEOUT = 120.0
+
+
+def _warn_no_budget() -> None:
+    warn_once("mlx has no context budget — --context short behaves as full here")
+
+
 class MlxBackend:
     """The mlx-whisper engine, run through whichever interpreter can import it."""
 
@@ -45,6 +57,8 @@ class MlxBackend:
 
     def __init__(self) -> None:
         self._runner = _resolve_runner()
+        # Probed lazily, once per run: see can_pin_prompt.
+        self._pins_prompt: bool | None = None
 
     def availability(self) -> Availability:
         if self._runner is None:
@@ -83,6 +97,62 @@ class MlxBackend:
         for warning in resources.check_memory(spec.size_bytes, model=model):
             print(f"stt: warning: {warning}")
 
+    def honours_context_budget(self) -> bool:
+        """No. `condition_on_previous_text` is a boolean with no token count behind it."""
+        return False
+
+    def pinning_the_prompt_costs_context(self) -> bool:
+        """No. `carry_initial_prompt` and `condition_on_previous_text` are separate
+        arguments, so the glossary can be pinned with no context carried at all."""
+        return False
+
+    async def can_pin_prompt(self) -> bool:
+        """Ask the worker's environment, once. See `base.Backend.can_pin_prompt`.
+
+        It costs one worker start — importing mlx_whisper, no model, no audio — and the
+        pipeline only asks when a glossary is actually going to be carried, so a run without
+        a dictionary pays nothing.
+        """
+        if self._pins_prompt is None:
+            if self._runner is None:
+                return False
+            self._pins_prompt = await self._ask_the_worker()
+            if not self._pins_prompt:
+                warn_once(
+                    "this mlx-whisper cannot pin the glossary to every window, so it only "
+                    "reaches the first one of each chunk (upgrade mlx-whisper)"
+                )
+        return self._pins_prompt
+
+    async def _ask_the_worker(self) -> bool:
+        """Run the probe, and refuse to guess when it does not answer.
+
+        A timeout or a crashed interpreter is not the same fact as "this build is too old",
+        and treating it as one is expensive twice over: the run decodes without the glossary
+        it asked for, and the shortfall goes into the cache key — so one flaky subprocess
+        makes a capable machine miss its own archive and re-decode the whole recording, with
+        an "upgrade mlx-whisper" message that is not true. An error says what happened.
+        """
+        assert self._runner is not None
+        _, base = self._runner
+        result = await proc.run([*base, str(WORKER), "--probe"], timeout=_PROBE_TIMEOUT)
+        try:
+            payload = as_dict(json.loads(result.stdout)) if result.ok else {}
+        except ValueError:
+            payload = {}
+        answer = payload.get("carry_initial_prompt")
+        if not isinstance(answer, bool):
+            raise EngineError(
+                what="could not ask mlx-whisper what it supports",
+                why=result.tail() or "the probe produced no answer",
+                how=(
+                    "check that mlx-whisper imports in this environment "
+                    "(`uv run --with mlx-whisper python -c 'import mlx_whisper'`), "
+                    "or run with --backend whispercpp"
+                ),
+            )
+        return answer
+
     async def decode(self, request: DecodeRequest) -> list[Segment]:
         if self._runner is None:
             raise EngineError(
@@ -103,11 +173,29 @@ class MlxBackend:
             argv += ["--language", request.language]
         if request.word_timestamps:
             argv += ["--word-timestamps"]
+        if request.max_context > 0:
+            # mlx-whisper exposes `condition_on_previous_text` as a plain boolean with no
+            # token budget, so `--context short` and `--context full` are the SAME thing on
+            # this backend: both carry whatever the model carries. Reported once rather than
+            # silently pretending the budget was honoured, because the two still produce
+            # different cache keys and a user who chose `short` for its lower loop risk
+            # would otherwise never learn they did not get it.
+            if request.max_context < FULL_CONTEXT:
+                _warn_no_budget()
+            argv += ["--carry-context"]
         if request.initial_prompt:
             argv += ["--initial-prompt", request.initial_prompt]
+        if request.carry_prompt and await self.can_pin_prompt():
+            # Without this the glossary reaches the model as a plain initial prompt, which
+            # whisper drops after the first 30-second window — so a dictionary would bias
+            # half a minute of a two-hour recording and quietly do nothing after that.
+            argv += ["--carry-prompt"]
 
         result = await proc.run(argv, timeout=proc.DEFAULT_TIMEOUT)
-        return _parse(_payload(result), offset=request.offset)
+        payload = _payload(result)
+        for warning in as_list(payload.get("warnings")):
+            warn_once(as_str(warning))
+        return _parse(payload, offset=request.offset)
 
 
 def _payload(result: proc.Result) -> JsonDict:
@@ -164,7 +252,6 @@ def _parse(raw: JsonDict, *, offset: float) -> list[Segment]:
 def _resolve_runner() -> tuple[str, list[str]] | None:
     """Pick the interpreter that will run the worker: ours if it can, else a uv environment."""
     import importlib.util
-    import sys
 
     if importlib.util.find_spec("mlx_whisper") is not None:
         return "direct", [sys.executable]

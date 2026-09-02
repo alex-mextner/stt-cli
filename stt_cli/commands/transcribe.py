@@ -21,6 +21,7 @@ from pathlib import Path
 from .. import config, formats, pipeline
 from .._errors import UsageError
 from ..archive import Archive, write_atomic
+from ..backends.base import CONTEXT_TOKENS
 from ..config import FORMATS, TIMESTAMP_MODES
 
 NAME = "transcribe"
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_engine_args(parser)
     _add_vad_args(parser)
     _add_cleaning_args(parser)
+    _add_dictionary_args(parser)
     _add_variant_args(parser)
     _add_enrichment_args(parser)
     _add_misc_args(parser)
@@ -86,6 +88,11 @@ def _add_engine_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--threads", type=int, default=None, help="engine threads (0 = engine default)"
     )
+    group.add_argument(
+        "--context", choices=tuple(CONTEXT_TOKENS), default=None,
+        help="feed the decoder its own previous output back (default off: loop-safe, but "
+             "costs casing and punctuation at window boundaries)",
+    )  # fmt: skip
 
 
 def _add_vad_args(parser: argparse.ArgumentParser) -> None:
@@ -118,6 +125,16 @@ def _add_cleaning_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dictionary_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("terminology (see `stt dict`)")
+    _flag(group, "dict", "use the dictionary (prompt the model, fix known misspellings)")
+    _flag(group, "dict-bias", "put the glossary in the speech model's prompt, not just the LLM's")
+    group.add_argument(
+        "--dict-similarity", type=float, default=None, metavar="N",
+        help="how alike a word must sound to be flagged as a term (0..1)",
+    )  # fmt: skip
+
+
 def _add_variant_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("decoding variants")
     group.add_argument(
@@ -127,6 +144,11 @@ def _add_variant_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--variant-model", action="append", default=None, metavar="MODEL",
         help="cross-check shaky segments against another model; repeatable",
+    )  # fmt: skip
+    group.add_argument(
+        "--context-compare", choices=pipeline.COMPARE_MODES, default=None,
+        help="decode a second time with the opposite --context and keep the disagreements "
+             "as variants; auto (implied by --fix) re-decodes only damaged-looking chunks",
     )  # fmt: skip
 
 
@@ -194,6 +216,14 @@ def _settings(args: argparse.Namespace) -> config.Settings:
         model=args.model,
         language=args.language,
         threads=args.threads,
+        context=args.context,
+        context_compare=args.context_compare,
+        # `--fix` implies the comparison only when nobody said otherwise; the flag defaults
+        # to None, so its presence is exactly the signal that somebody did.
+        context_compare_chosen=True if args.context_compare is not None else None,
+        dictionary=args.dict,
+        dict_bias=args.dict_bias,
+        dict_similarity=args.dict_similarity,
         vad=args.vad,
         vad_threshold=args.vad_threshold,
         vad_min_silence_ms=args.vad_min_silence_ms,

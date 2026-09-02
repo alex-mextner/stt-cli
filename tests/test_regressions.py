@@ -245,3 +245,74 @@ def test_an_extensionless_file_is_not_mistaken_for_a_command(tmp_path: Path, mon
     monkeypatch.chdir(tmp_path)
     assert not _looks_like_a_command("Interview")
     assert _looks_like_a_command("Interviewww")
+
+
+def test_write_atomic_leaves_no_neighbour_behind_when_the_rename_fails(tmp_path, monkeypatch):
+    """The temporary neighbour is what makes the write atomic. If it survives a failure it
+    is a stale fragment of somebody's transcript sitting next to the real one forever."""
+    import pathlib
+
+    target = tmp_path / "transcript.json"
+    original = pathlib.Path.replace
+
+    def refuse(self, other):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(pathlib.Path, "replace", refuse)
+    with pytest.raises(OSError):
+        write_atomic(target, '{"a": 1}')
+    monkeypatch.setattr(pathlib.Path, "replace", original)
+
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == [], "a .part file was left behind"
+
+
+def test_write_atomic_neighbours_do_not_collide_between_processes(tmp_path, monkeypatch):
+    """A shared temp name lets two processes writing one target interleave into the same
+    file, and the "atomic" rename then publishes a blend of both. The name is gone by the
+    time the test could look at it, so the rename is intercepted to record what it saw."""
+    import os
+    import pathlib
+
+    used: list[str] = []
+    original = pathlib.Path.replace
+
+    def record(self, other):
+        used.append(self.name)
+        return original(self, other)
+
+    monkeypatch.setattr(pathlib.Path, "replace", record)
+    target = tmp_path / "transcript.json"
+    write_atomic(target, "mine")
+
+    assert target.read_text("utf-8") == "mine"
+    assert used and str(os.getpid()) in used[0], f"a shared temp name is back: {used}"
+
+
+def test_two_writers_in_one_process_do_not_take_each_others_temporary(tmp_path) -> None:
+    """The pid alone did not separate two threads: they shared one `<target>.<pid>.part`,
+    so the second `replace` found its own temporary already renamed away and raised — or
+    published the other writer's half-written content."""
+    import threading
+
+    from stt_cli.archive import write_atomic
+
+    target = tmp_path / "transcript.json"
+    errors: list[BaseException] = []
+
+    def write(payload: str) -> None:
+        try:
+            for _ in range(40):
+                write_atomic(target, payload)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(text,)) for text in ("first", "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10.0)
+
+    assert not errors, f"a concurrent writer failed: {errors}"
+    assert target.read_text("utf-8") in {"first", "second"}, "and never a blend of the two"
+    assert list(tmp_path.glob("*.part")) == [], "no temporary is left behind"

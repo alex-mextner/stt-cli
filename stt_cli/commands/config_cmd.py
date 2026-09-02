@@ -45,9 +45,7 @@ def _list() -> int:
     settings = config.load_settings()
     stored = _stored()
     print(f"{'setting':<24} {'value':<28} source")
-    for name in sorted(settings.__dataclass_fields__):
-        if name in {"output", "recorded_at"}:
-            continue
+    for name in sorted(config.configurable()):
         value = getattr(settings, name)
         source = "config file" if name in stored else "default"
         print(f"{name:<24} {_show(value):<28} {source}")
@@ -68,21 +66,20 @@ def _stored() -> JsonDict:
 
 def _get(key: str) -> int:
     settings = config.load_settings()
-    if key not in settings.__dataclass_fields__:
+    if key not in config.configurable():
         from .._errors import unknown_item
 
-        raise unknown_item("setting", key, sorted(settings.__dataclass_fields__))
+        raise unknown_item("setting", key, sorted(config.configurable()))
     print(_show(getattr(settings, key)))
     return EXIT_OK
 
 
 def _set(key: str, raw: str) -> int:
     """Store one setting, coercing the argv string to the field's DECLARED type."""
-    settings = config.load_settings()
-    if key not in settings.__dataclass_fields__:
+    if key not in config.configurable():
         from .._errors import unknown_item
 
-        raise unknown_item("setting", key, sorted(settings.__dataclass_fields__))
+        raise unknown_item("setting", key, sorted(config.configurable()))
     value = config.coerce(key, raw)
     config.save_setting(key, value)
     print(f"{key} = {_show(value)}   ({config.config_path()})")

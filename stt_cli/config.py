@@ -22,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .dictionary import DEFAULT_SIMILARITY
+
 APP_NAME = "stt-cli"
 
 # Formats the renderers can produce. `all` expands to this list minus the JSON-ish debug
@@ -80,6 +82,20 @@ class Settings:
     threads: int = 0  # 0 -> let the engine choose
     whispercpp_root: str | None = None
 
+    # How much of its own previous output the decoder is fed back as context. Carrying it
+    # keeps casing, punctuation and proper nouns consistent across the model's 30-second
+    # windows; it is also exactly what lets a repetition loop feed itself, because a garbage
+    # phrase in the prompt makes the same garbage the likeliest continuation. `off` is the
+    # safe default and `context_compare` is how you get the quality back without the risk.
+    context: str = "off"  # off | short | full
+    context_compare: str = "off"
+    # Did somebody actually CHOOSE the mode above, or is it just the built-in default?
+    # `--fix` turns the comparison on when nobody chose, because an LLM asked to correct a
+    # transcript with the disagreements hidden from it is guessing. It must not override a
+    # person who typed `--context-compare off`, which is why the two are not the same fact.
+    # Never configurable and never in the cache key: what gets keyed is the mode it settles.
+    context_compare_chosen: bool = False
+
     # voice activity detection
     vad: str = "auto"  # auto | silero | ffmpeg | none
     vad_threshold: float = 0.5
@@ -92,6 +108,23 @@ class Settings:
     strict_clean: bool = False
     max_repeats: int = 3
     confidence_floor: float = 0.55
+
+    # terminology (see dictionary.py: prompt biasing, exact fixes, phonetic flags)
+    dictionary: bool = True
+    dict_bias: bool = True  # feed the glossary to the speech model, not just to the LLM
+    # One source for the number: `dictionary.apply`/`screen` take it as their default
+    # argument, so a value written down twice would let a direct caller and the
+    # pipeline disagree about what the threshold is.
+    dict_similarity: float = DEFAULT_SIMILARITY
+    # Filled in by the pipeline from the dictionary's content, never by the user: it exists
+    # so that editing a term invalidates exactly the cached runs it would have changed.
+    dict_digest: str = ""
+    # Also filled in by the pipeline, from the ENGINES: a sorted, comma-joined list of what
+    # the installed engines could not actually do for this run ("whispercpp cannot pin the
+    # glossary"). Such a run decodes differently from one where they could, so it must not
+    # share that run's identity — otherwise upgrading the engine changes nothing and the
+    # compromised transcript is served forever. Empty means nothing fell short.
+    engine_limits: str = ""
 
     # variants
     variants: int = 0  # extra decodings per low-confidence segment
@@ -131,7 +164,21 @@ class Settings:
 
 # Only these keys may come from the on-disk config. An unknown key is a typo the user
 # should hear about rather than a silently ignored preference.
-_CONFIGURABLE = {f for f in Settings.__dataclass_fields__ if f not in {"output", "recorded_at"}}
+def configurable() -> set[str]:
+    """The settings a person may read and write. `config list`/`get` ask this too.
+
+    Listing every dataclass field advertised `dict_digest` and `engine_limits` — the run's
+    own identity, computed by the pipeline — as if they were preferences, and `config set`
+    then refused them as unknown. One contract, asked by all three commands.
+    """
+    return set(_CONFIGURABLE)
+
+
+_CONFIGURABLE = {
+    f
+    for f in Settings.__dataclass_fields__
+    if f not in {"output", "recorded_at", "dict_digest", "engine_limits", "context_compare_chosen"}
+}
 
 
 def load_settings() -> Settings:
@@ -158,7 +205,10 @@ def load_settings() -> Settings:
             how="remove the key, or check `stt config list` for its real name",
         )
     _validate(raw)
-    return replace(settings, **raw)
+    settled = replace(settings, **raw)
+    if "context_compare" in raw:
+        settled = replace(settled, context_compare_chosen=True)
+    return settled
 
 
 # The declared type of each setting, taken from the dataclass annotation rather than from

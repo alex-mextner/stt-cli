@@ -26,6 +26,8 @@ async. Zero required third-party runtime dependencies.
 | `variants.py` | second-opinion decodings for low-confidence segments |
 | `llm.py`, `postprocess.py` | LLM correction and structured summary via an installed agent CLI |
 | `diarize.py` | optional pyannote speaker diarization |
+| `hf.py`, `auth.py` | Hugging Face credentials and the `stt login` browser flow |
+| `dictionary.py`, `fuzzy.py` | terminology: prompt biasing, exact fixes, phonetic flags |
 | `archive.py` | content-addressed store plus a SQLite index |
 | `formats.py`, `timestamps.py` | renderers and the three timestamp modes |
 | `registry.py` | the model pool: one human name per model, per-engine ids, sizes |
@@ -40,9 +42,11 @@ async. Zero required third-party runtime dependencies.
   demand. Do not add a `dependencies` entry to `pyproject.toml` without a very good reason.
 - **Every external process in the transcription path goes through `proc.run`.** It has a
   timeout, turns a missing binary into a diagnosed error, and is `async` so independent work
-  overlaps. The two deliberate exceptions are synchronous, interactive and outside that path:
-  the `pip install` in `commands/diarize_cmd.py` (streams progress to the user's terminal)
-  and the `open` in `commands/archive.py` (fire-and-forget Finder reveal).
+  overlaps. The deliberate exceptions are all synchronous, interactive and outside that
+  path: the `pip install` in `commands/diarize_cmd.py` (streams progress to the user's
+  terminal), the `open` in `commands/archive.py` (fire-and-forget Finder reveal), and the
+  `urllib` calls plus `pbpaste` poll in `hf.py`/`auth.py` (a login is a conversation with a
+  human, and `urllib` keeps the token out of an argument vector that `curl` would expose).
 - **Every failure is an `SttError` subclass** with what/why/how and a stable exit code
   (see `_errors.py`). Never `sys.exit(1)` with a bare message.
 - **Nothing durable in `/tmp`.** Audio and transcripts live in the archive under
@@ -61,6 +65,30 @@ async. Zero required third-party runtime dependencies.
 - **Every file in the archive is written through `archive.write_atomic`** (or the ffmpeg
   `.part`-then-rename equivalent). A truncated transcript looks present forever.
 - **A naive `recorded_at` is wall-clock time and must be localized, never converted.**
+- **The dictionary corrects only what the user wrote down.** An `aka` spelling is a fact and
+  is substituted; a phonetic near-match is a suspicion and is only ever flagged, for the
+  reader and for the LLM pass. Never promote a near-match to a replacement.
+- **Anything that changes the words has to be settled before the fingerprint is computed** —
+  the dictionary digest and the comparison mode `--fix` implies, in `pipeline._resolve`;
+  what the installed engines can actually do, in `_settle_engine_limits`. A value that is
+  decided later is a value the cache does not know about, and the stale transcript gets
+  served as if it had it.
+- **The archive is asked before any engine is touched — for the un-settled key only.** A run
+  stored by a fully capable machine is served without resolving, probing or downloading
+  anything. A run whose key was narrowed by settling (an engine that could not pin the
+  glossary, a cross-check that was missing, whisper.cpp's bought context budget) can only be
+  found by a second lookup, after the probes that reproduce that key — so on those machines
+  a cache hit does cost the probes, and `usable_cross_backends` will fetch a missing
+  cross-check model on the way. That is the price of a key that tells the truth; if it ever
+  needs to be cheaper, split "is this model obtainable" from "obtain it", do not move the
+  answer back after the fingerprint.
+- **`-mc 0` disables whisper.cpp's initial prompt entirely** (verified: two runs with and
+  without `--prompt` were byte-identical). A carried glossary therefore has to buy itself a
+  context budget — see `PROMPT_CONTEXT` in `backends/whispercpp.py`.
+- **A credential is never printed, and never stored anywhere but the provider's own
+  location.** `hf.token_source()` returns a path or a variable name, never a token, and the
+  Hugging Face token goes to the file `huggingface_hub` reads so that pyannote is logged in
+  too. A store private to stt would make stt the only thing that works.
 - **Never decode one VAD span per engine invocation.** That was the first implementation and
   it reloaded a 1.6 GB model 431 times for one hour of audio. Speech is spliced into a few
   long chunks by `chunks.py` instead.
