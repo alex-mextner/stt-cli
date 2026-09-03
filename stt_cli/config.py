@@ -15,12 +15,23 @@ WHERE THINGS LIVE
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from .dictionary import DEFAULT_SIMILARITY
+from .jsonio import ABSENT, read_json
+
+# A settings file is a dozen keys. The bound is here for the same reason the dictionary's is:
+# this file is read by every run, and anything can be sitting at that path.
+MAX_CONFIG_BYTES = 1024 * 1024
 
 APP_NAME = "stt-cli"
 
@@ -56,8 +67,11 @@ def models_dir() -> Path:
     return app_home() / "models"
 
 
+CONFIG_FILENAME = "config.json"
+
+
 def config_path() -> Path:
-    return app_home() / "config.json"
+    return app_home() / CONFIG_FILENAME
 
 
 def index_path() -> Path:
@@ -80,6 +94,20 @@ class Settings:
     threads: int = 0  # 0 -> let the engine choose
     whispercpp_root: str | None = None
 
+    # How much of its own previous output the decoder is fed back as context. Carrying it
+    # keeps casing, punctuation and proper nouns consistent across the model's 30-second
+    # windows; it is also exactly what lets a repetition loop feed itself, because a garbage
+    # phrase in the prompt makes the same garbage the likeliest continuation. `off` is the
+    # safe default and `context_compare` is how you get the quality back without the risk.
+    context: str = "off"  # off | short | full
+    context_compare: str = "off"
+    # Did somebody actually CHOOSE the mode above, or is it just the built-in default?
+    # `--fix` turns the comparison on when nobody chose, because an LLM asked to correct a
+    # transcript with the disagreements hidden from it is guessing. It must not override a
+    # person who typed `--context-compare off`, which is why the two are not the same fact.
+    # Never configurable and never in the cache key: what gets keyed is the mode it settles.
+    context_compare_chosen: bool = False
+
     # voice activity detection
     vad: str = "auto"  # auto | silero | ffmpeg | none
     vad_threshold: float = 0.5
@@ -92,6 +120,23 @@ class Settings:
     strict_clean: bool = False
     max_repeats: int = 3
     confidence_floor: float = 0.55
+
+    # terminology (see dictionary.py: prompt biasing, exact fixes, phonetic flags)
+    dictionary: bool = True
+    dict_bias: bool = True  # feed the glossary to the speech model, not just to the LLM
+    # One source for the number: `dictionary.apply`/`screen` take it as their default
+    # argument, so a value written down twice would let a direct caller and the
+    # pipeline disagree about what the threshold is.
+    dict_similarity: float = DEFAULT_SIMILARITY
+    # Filled in by the pipeline from the dictionary's content, never by the user: it exists
+    # so that editing a term invalidates exactly the cached runs it would have changed.
+    dict_digest: str = ""
+    # Also filled in by the pipeline, from the ENGINES: a sorted, comma-joined list of what
+    # the installed engines could not actually do for this run ("whispercpp cannot pin the
+    # glossary"). Such a run decodes differently from one where they could, so it must not
+    # share that run's identity — otherwise upgrading the engine changes nothing and the
+    # compromised transcript is served forever. Empty means nothing fell short.
+    engine_limits: str = ""
 
     # variants
     variants: int = 0  # extra decodings per low-confidence segment
@@ -131,7 +176,53 @@ class Settings:
 
 # Only these keys may come from the on-disk config. An unknown key is a typo the user
 # should hear about rather than a silently ignored preference.
-_CONFIGURABLE = {f for f in Settings.__dataclass_fields__ if f not in {"output", "recorded_at"}}
+def configurable() -> set[str]:
+    """The settings a person may read and write. `config list`/`get` ask this too.
+
+    Listing every dataclass field advertised `dict_digest` and `engine_limits` — the run's
+    own identity, computed by the pipeline — as if they were preferences, and `config set`
+    then refused them as unknown. One contract, asked by all three commands.
+    """
+    return set(_CONFIGURABLE)
+
+
+_CONFIGURABLE = {
+    f
+    for f in Settings.__dataclass_fields__
+    if f not in {"output", "recorded_at", "dict_digest", "engine_limits", "context_compare_chosen"}
+}
+
+
+def _settings_object(path: Path) -> dict[str, Any]:
+    """The contents of `config.json`, or the reason it cannot be one.
+
+    Both the reader and the writer go through here, and that is the point. When only the
+    reader checked the shape, `stt config list` reported a `config.json` holding `[]` as
+    broken while `stt config set` quietly replaced it with a fresh object — the same file,
+    diagnosed by one command and destroyed by the other.
+    """
+    from ._errors import UsageError
+
+    raw = read_json(
+        path,
+        how="fix the JSON, save it as UTF-8, or delete it for the defaults",
+        limit=MAX_CONFIG_BYTES,
+        too_big="a settings file is a handful of keys, not a document",
+    )
+    if raw is ABSENT:
+        return {}
+    if not isinstance(raw, dict):
+        raise UsageError(
+            what=f"{path} is not a settings file",
+            why='expected an object of setting names and values, like {"language": "ru"}',
+            how="write {} into it, or delete it to fall back to the defaults",
+        )
+    return raw
+
+
+def stored() -> dict[str, Any]:
+    """The settings actually written in `config.json`, so a caller can say which are stored."""
+    return _settings_object(config_path())
 
 
 def load_settings() -> Settings:
@@ -140,16 +231,9 @@ def load_settings() -> Settings:
 
     path = config_path()
     settings = Settings()
-    if not path.is_file():
+    raw = _settings_object(path)
+    if not raw:
         return settings
-    try:
-        raw = json.loads(path.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise UsageError(
-            what=f"could not read {path}",
-            why=str(exc),
-            how="fix the JSON, or delete the file to fall back to defaults",
-        ) from exc
     unknown = sorted(set(raw) - _CONFIGURABLE)
     if unknown:
         raise UsageError(
@@ -158,7 +242,10 @@ def load_settings() -> Settings:
             how="remove the key, or check `stt config list` for its real name",
         )
     _validate(raw)
-    return replace(settings, **raw)
+    settled = replace(settings, **raw)
+    if "context_compare" in raw:
+        settled = replace(settled, context_compare_chosen=True)
+    return settled
 
 
 # The declared type of each setting, taken from the dataclass annotation rather than from
@@ -234,26 +321,138 @@ def _validate(raw: dict[str, Any]) -> None:
 
 
 def save_setting(key: str, value: Any) -> None:
-    """Persist one preference into ``config.json``, leaving the rest untouched."""
+    """Persist one preference into ``config.json``, leaving the rest untouched.
+
+    The whole of this is one transaction over ONE file, and both halves of that sentence had
+    to be argued for.
+
+    One file: `config.json` may be a symlink into a dotfiles checkout, which is an ordinary
+    thing to do, so the link is resolved once at the top and everything after — the check,
+    the lock, the read and the write — happens on the resolved target. Resolving it a second
+    time later left a gap in between for the link to be repointed, which turns "write my
+    config" into "rename a file over whatever that points at now"; and locking beside the
+    link rather than beside the target meant two `STT_HOME`s pointing at one file took two
+    different locks and did not exclude each other at all.
+
+    One transaction: reading the whole file, changing one key and writing the whole file back
+    is three operations, and two terminals doing it at once both read the old object — then
+    whichever renames last stores a version that never saw the other's key, gone with no
+    error anywhere. The lock spans the read and the write, the way `dictionary.editing` does.
+    """
     from ._errors import unknown_item
 
     if key not in _CONFIGURABLE:
         raise unknown_item("setting", key, sorted(_CONFIGURABLE))
     ensure_dirs()
-    path = config_path()
-    raw: dict[str, Any] = {}
-    if path.is_file():
-        # Read through the same guarded loader path rather than a bare json.loads: a corrupt
-        # config must produce the diagnosed error, not a raw JSONDecodeError traceback.
-        try:
-            raw = json.loads(path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            from ._errors import UsageError
+    named = config_path()
+    target = Path(os.path.realpath(named))
+    _refuse_a_strange_target(target)
+    # Imported here, not at the top: `archive` imports `config` back, the way
+    # `dictionary.save` does it for the same reason.
+    from .archive import write_atomic
 
+    with _editing_the_settings(target):
+        # Through the same guarded loader as everything else: a corrupt config must produce
+        # the diagnosed error, not a traceback out of json or the codec — and not, as an
+        # earlier version of this line did through `as_dict`, a silent `{}` written back over
+        # whatever was really in the file.
+        raw: dict[str, Any] = _settings_object(target)
+        raw[key] = value
+        write_atomic(target, _serialized(raw, named))
+
+
+@contextmanager
+def _editing_the_settings(target: Path) -> Iterator[None]:
+    """An exclusive lock over one read-modify-write of the settings file.
+
+    Beside the RESOLVED target, so that two homes whose `config.json` links to the same file
+    take the same lock. And opened the way every other file here is opened — non-blocking,
+    with the descriptor asked what it is — because a lock file is a file like any other, and
+    a named pipe sitting where it goes would have hung `stt config set` forever on the very
+    line that was added to make the command safe.
+    """
+    from ._errors import UsageError
+
+    lock = target.with_name(target.name + ".lock")
+    try:
+        # Owner only. The file holds nothing — it exists to be flocked — but there is no
+        # reason for anything else on the machine to be able to open it, and a mode that
+        # says "world readable" invites the question of what is in it.
+        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NONBLOCK, 0o600)
+    except OSError as exc:
+        raise UsageError(
+            what=f"could not lock {target}",
+            why=str(exc),
+            how=f"remove {lock} if something else is sitting in its place",
+        ) from exc
+    # The raw descriptor, not a file object: wrapping a FIFO in one raises before the check
+    # that was supposed to catch the FIFO.
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise UsageError(
-                what=f"could not read {path}",
-                why=str(exc),
-                how="fix the JSON, or delete the file to fall back to defaults",
-            ) from exc
-    raw[key] = value
-    path.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", "utf-8")
+                what=f"could not lock {target}",
+                why=f"{lock} is not a regular file",
+                how="move it out of the way",
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _refuse_a_strange_target(path: Path) -> None:
+    """Say no to writing over something that is not a settings file.
+
+    The reader treats anything that is not a regular file as "there is no config", which is
+    right for reading and leaves the writer standing in front of whatever IS there. Opening a
+    FIFO for writing blocks until somebody reads it — `stt config set` hanging with no
+    message — and a directory raises out of the middle of the write. Neither is a thing to
+    do to a path the user pointed `STT_HOME` at.
+
+    Following symlinks, deliberately, because the reader does: `os.open` resolves the link
+    and asks the descriptor what it is. Checking the link itself instead made a `config.json`
+    symlinked into a dotfiles checkout readable by every command and writable by none.
+    """
+    from ._errors import UsageError
+
+    try:
+        found = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError as exc:
+        raise UsageError(
+            what=f"could not write {path}",
+            why=str(exc),
+            how="check the path is writable, or point STT_HOME somewhere else",
+        ) from exc
+    if not stat.S_ISREG(found.st_mode):
+        raise UsageError(
+            what=f"{path} is not a settings file",
+            why="something that is not a regular file is sitting where config.json goes",
+            how="move it out of the way, or point STT_HOME somewhere else",
+        )
+
+
+def _serialized(raw: dict[str, Any], path: Path) -> str:
+    """The file, refused here if the reader would refuse it.
+
+    A hand-edited `config.json` just under the limit loads fine, and `stt config set` then
+    re-serializes it with indentation and one more key — over the line. The command reported
+    success and every `stt` invocation after it failed before doing any work, on a file
+    nothing would read. The same guard the dictionary has, for the same reason: the failure
+    belongs at the write that causes it, not at every read that follows.
+    """
+    from ._errors import UsageError
+    from .jsonio import in_units
+
+    blob = json.dumps(raw, indent=2, ensure_ascii=False) + "\n"
+    if len(blob.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise UsageError(
+            what=f"{path} would be too large to read back",
+            why=f"it serializes to more than {in_units(MAX_CONFIG_BYTES)}",
+            how="remove what you do not need from it, or delete it for the defaults",
+        )
+    return blob

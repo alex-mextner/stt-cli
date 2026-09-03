@@ -168,6 +168,25 @@ def collapse_loops(text: str, max_repeats: int, segment: Segment, report: CleanR
     return text
 
 
+def collapse_only(segments: list[Segment], max_repeats: int) -> int:
+    """Collapse repetition loops in place, without the rest of the filter. Returns the count.
+
+    The comparison decode behind ``--context-compare`` never becomes the transcript, so it
+    must not get the full pass: dropping segments from it would leave primary segments with
+    nothing to compare against, which reads as agreement when it is really absence. Loops
+    are the exception — a runaway repetition is worthless as an alternative reading and
+    would only bloat the prompt handed to the LLM.
+    """
+    report = CleanReport()
+    collapsed = 0
+    for segment in segments:
+        text = collapse_loops(segment.text, max_repeats, segment, report)
+        if text != segment.text:
+            segment.text = text
+            collapsed += 1
+    return collapsed
+
+
 def _collapse_ngram(words: list[str], size: int, max_repeats: int) -> list[str] | None:
     """Rewrite runs of an identical ``size``-word group; ``None`` when nothing repeated."""
     out: list[str] = []

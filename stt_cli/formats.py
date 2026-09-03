@@ -99,9 +99,24 @@ def _line(segment: Segment, stamper: Stamper, options: RenderOptions) -> str:
     if options.show_confidence and segment.confidence is not None:
         parts.append(f"({segment.confidence:.2f})")
     if options.show_flags and segment.flags:
-        parts.append(f"<{','.join(segment.flags)}>")
+        parts.append(f"<{','.join(_flag_labels(segment))}>")
     parts.append(chosen_text(segment, options))
     return " ".join(parts)
+
+
+def _flag_labels(segment: Segment) -> list[str]:
+    """The flags, with the terminology one carrying the candidate it is about.
+
+    A bare `term` tells the reader something was suspected and not WHAT — and the whole
+    point of the flag is that a person can look at the word and say yes or no. The pair
+    lives in its own field so that the flag vocabulary stays closed; this is where the two
+    are put back together for someone to READ. Machine-readable formats keep them apart:
+    see `_delimited`, which gives `suspected` a column.
+    """
+    # Joined with ";" because `_line` joins the flags themselves with ",": using the
+    # same character would make two suspects look like two flags.
+    suspects = ";".join(f"{heard}~{term}" for heard, term in segment.suspected_terms)
+    return [f"term: {suspects}" if flag == "term" and suspects else flag for flag in segment.flags]
 
 
 def chosen_text(segment: Segment, options: RenderOptions) -> str:
@@ -205,7 +220,12 @@ def _delimited(
 ) -> str:
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=delimiter, lineterminator="\n")
-    writer.writerow(["start", "end", "at", "speaker", "confidence", "flags", "text"])
+    # `suspected` has a column of its own: `flags` is a closed vocabulary joined into one
+    # cell, and a term name can contain the separator. Putting the pairs there would make an
+    # embedded "|" indistinguishable from the join — the exact smuggling their own field on
+    # `Segment` exists to prevent. The human-readable renderer, which quotes nothing and is
+    # read by a person, does label the flag with them.
+    writer.writerow(["start", "end", "at", "speaker", "confidence", "flags", "suspected", "text"])
     for segment in transcript.segments:
         writer.writerow(
             [
@@ -215,10 +235,29 @@ def _delimited(
                 segment.speaker or "" if options.show_speakers else "",
                 "" if segment.confidence is None else f"{segment.confidence:.4f}",
                 "|".join(segment.flags),
-                chosen_text(segment, options),
+                _inert("|".join(f"{heard}~{term}" for heard, term in segment.suspected_terms)),
+                _inert(chosen_text(segment, options)),
             ]
         )
     return buffer.getvalue()
+
+
+# What a spreadsheet reads as the start of a formula rather than as text.
+_FORMULA_STARTERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _inert(cell: str) -> str:
+    """Make a cell that a spreadsheet would execute into one it will only display.
+
+    This format exists to be opened in a spreadsheet, and a transcript is not trusted text:
+    the words come from whoever was recorded, and the terminology can be imported from a
+    glossary somebody else wrote — `=1+1 = Vigma` in an imported file rewrites a segment to
+    `=1+1`, which Excel evaluates on open. The leading apostrophe is the standard defusing
+    and is not part of the value: a spreadsheet consumes it, and anything reading the file
+    as data reads one extra character it can strip. Only these two columns carry free text;
+    the rest are numbers, timestamps and a closed flag vocabulary.
+    """
+    return f"'{cell}" if cell.startswith(_FORMULA_STARTERS) else cell
 
 
 # ── dialogue ──────────────────────────────────────────────────────────────────

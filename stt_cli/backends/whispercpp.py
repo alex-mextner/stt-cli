@@ -27,7 +27,7 @@ from .. import config, proc, registry, resources
 from .._errors import EngineError, NetworkError
 from ..jsonio import JsonDict, as_dict, as_dicts, as_float, as_str
 from ..models import Segment, Word
-from .base import Availability, DecodeRequest, VadProvider, confidence_from_probs
+from .base import Availability, DecodeRequest, VadProvider, confidence_from_probs, warn_once
 
 NAME = "whispercpp"
 
@@ -58,6 +58,14 @@ INSTALL_HINT = (
 )
 
 
+# Context budget granted to a carried glossary: enough for the prompt itself plus a few
+# tokens, not enough for a repetition loop to build on.
+PROMPT_CONTEXT = 64
+
+# `whisper-cli --help` prints and exits; anything slower than this is a broken binary.
+_HELP_TIMEOUT = 20.0
+
+
 class WhisperCppBackend:
     """The whisper.cpp engine, located once and reused for every chunk of a run."""
 
@@ -67,6 +75,8 @@ class WhisperCppBackend:
         self._root = _resolve_root(root)
         self._cli = _find_binary("whisper-cli", self._root)
         self._vad_binary = _find_binary("whisper-vad-speech-segments", self._root)
+        # Probed lazily, once per run: see can_pin_prompt.
+        self._carries_prompt: bool | None = None
 
     # ── availability ──────────────────────────────────────────────────────────
     def availability(self) -> Availability:
@@ -141,9 +151,10 @@ class WhisperCppBackend:
                 why="no whisper-cli binary was found",
                 how=INSTALL_HINT,
             )
+        carry = request.carry_prompt and await self.can_pin_prompt()
         with tempfile.TemporaryDirectory(prefix="stt-whispercpp-") as tmp:
             stem = Path(tmp) / "out"
-            argv = self._argv(request, stem)
+            argv = self._argv(request, stem, carry_prompt=carry)
             result = await proc.run(argv, timeout=proc.DEFAULT_TIMEOUT)
             payload = stem.with_suffix(".json")
             if not result.ok or not payload.is_file():
@@ -158,7 +169,47 @@ class WhisperCppBackend:
             raw = as_dict(json.loads(payload.read_text("utf-8")))
         return _parse(raw, offset=request.offset)
 
-    def _argv(self, request: DecodeRequest, stem: Path) -> list[str]:
+    def honours_context_budget(self) -> bool:
+        """Yes: `-mc` is a token count, so `short` and `full` really are different runs."""
+        return True
+
+    def pinning_the_prompt_costs_context(self) -> bool:
+        """Yes. Measured: with `-mc 0` the initial prompt has no effect at all, so a carried
+        glossary has to buy itself a budget — see PROMPT_CONTEXT and `_argv`."""
+        return True
+
+    async def can_pin_prompt(self) -> bool:
+        """Does this whisper-cli have --carry-initial-prompt? Asked once per run.
+
+        The flag is not ancient, and the binary is whatever is on PATH — a Homebrew install
+        can easily predate it. Passing an unknown flag makes whisper-cli print its usage and
+        exit, so a single `stt dict add` would otherwise break every transcription on that
+        machine with an error that says nothing about versions.
+        """
+        if self._carries_prompt is None:
+            if self._cli is None:
+                return False
+            result = await proc.run([str(self._cli), "--help"], timeout=_HELP_TIMEOUT)
+            printed = result.stdout + result.stderr
+            if not printed.strip():
+                # A binary that printed no usage at all did not answer the question, and
+                # "did not answer" is not "does not support it". Guessing here would decode
+                # without the glossary AND file the run under a shortfall in the cache key.
+                raise EngineError(
+                    what="could not ask whisper-cli what it supports",
+                    why=f"`{self._cli} --help` printed nothing",
+                    how="check the binary runs at all, or reinstall whisper.cpp",
+                )
+            self._carries_prompt = "--carry-initial-prompt" in printed
+            if not self._carries_prompt:
+                warn_once(
+                    "this whisper-cli has no --carry-initial-prompt, so the glossary reaches "
+                    "at most the first window of each chunk, and nothing at all unless a "
+                    "context budget is asked for (--context short) — upgrade whisper.cpp"
+                )
+        return self._carries_prompt
+
+    def _argv(self, request: DecodeRequest, stem: Path, *, carry_prompt: bool) -> list[str]:
         """Build the whisper-cli command line for one decoding pass.
 
         Two flags here are doing real work rather than tuning.
@@ -184,19 +235,52 @@ class WhisperCppBackend:
             "-oj", "-ojf", "-of", str(stem),
             "-np",
             "--suppress-nst",
-            "-mc", "0",
+            "-mc", str(request.max_context),
             "-tp", f"{request.temperature:.2f}",
         ]  # fmt: skip
+        if request.initial_prompt and carry_prompt:
+            # Measured, not assumed: with -mc 0 the initial prompt has NO effect at all —
+            # whisper.cpp builds the prompt only inside `if (n_max_text_ctx > 0)`, and two
+            # runs over the same recording with and without --prompt came back byte for
+            # byte identical. So a carried glossary has to buy itself a budget. With
+            # --carry-initial-prompt the glossary is pinned as a static prefix and only
+            # what is left of PROMPT_CONTEXT can hold carried-back output, which keeps the
+            # loop risk bounded instead of reopening it completely.
+            argv += ["--carry-initial-prompt"]
+            argv[argv.index("-mc") + 1] = str(max(request.max_context, PROMPT_CONTEXT))
+            if request.max_context < PROMPT_CONTEXT:
+                warn_once(
+                    f"glossary carried: whisper.cpp needs a context budget for it, so this "
+                    f"run decodes with -mc {PROMPT_CONTEXT} instead of {request.max_context}"
+                )
         argv += ["-l", request.language or "auto"]
         if request.threads:
             argv += ["-t", str(request.threads)]
-        if request.initial_prompt:
+        if request.initial_prompt and self._prompt_lands(request, carry_prompt=carry_prompt):
             argv += ["--prompt", request.initial_prompt]
         # A greedy pass at temperature 0 is deterministic and reproducible, which is what
         # the cache key promises. Sampling only happens when a variant explicitly asks.
         if request.temperature == 0.0:
             argv += ["-bo", "1", "-bs", "1"]
         return argv
+
+    @staticmethod
+    def _prompt_lands(request: DecodeRequest, *, carry_prompt: bool) -> bool:
+        """Would `--prompt` actually change anything on this command line?
+
+        On a whisper-cli old enough to lack ``--carry-initial-prompt`` the branch above never
+        raises the budget, and the default budget is zero — so ``--prompt`` was passed to a
+        decoder that, by this file's own measurement, ignores it entirely. The flag then
+        cost nothing and bought nothing, while the warning told the user the glossary was
+        reaching the first window. Buying the budget anyway is the wrong trade here: without
+        the carry flag nothing pins the glossary to the front, so the tokens would be spent
+        on the decoder's own previous output — which is the repetition loop `-mc 0` exists
+        to prevent, reopened in full for a glossary that would be evicted from the window
+        regardless. So the prompt is dropped, the warning says the glossary needs
+        ``--context short`` on this binary, and `can_pin_prompt` has already written the
+        shortfall into the run's cache key, so an upgraded whisper.cpp re-transcribes.
+        """
+        return carry_prompt or request.max_context > 0
 
 
 def _parse(raw: JsonDict, *, offset: float) -> list[Segment]:

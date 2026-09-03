@@ -27,6 +27,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .jsonio import read_lines
+
+# A few dozen phrases, one per line.
+MAX_PATTERN_BYTES = 256 * 1024
+
 # Unmistakable artefacts: subtitle credits, transcription-service plugs, channel calls to
 # action. None of these belong in a recording of your own meeting.
 ALWAYS: tuple[str, ...] = (
@@ -80,11 +85,22 @@ def user_patterns_path(home: Path) -> Path:
 
 
 def load_user_patterns(home: Path) -> list[str]:
-    """Read the user's own always-drop patterns, ignoring blanks and ``#`` comments."""
-    path = user_patterns_path(home)
-    if not path.is_file():
+    """Read the user's own always-drop patterns, ignoring blanks and ``#`` comments.
+
+    Through the same guarded door as the two JSON files, and for the same reasons: this is
+    read on the default path, so an editor that saved it as Latin-1, or a permission that
+    changed, has to answer with the diagnosed error rather than a traceback — or, worse,
+    with an empty list. Silently returning nothing would drop the user's own patterns from
+    a run that then looks like it worked.
+    """
+    lines = read_lines(
+        user_patterns_path(home),
+        how="save it as UTF-8, or delete it to use the built-in patterns only",
+        limit=MAX_PATTERN_BYTES,
+        too_big="this is a short list of phrases, one per line",
+    )
+    if lines is None:
         return []
-    lines = path.read_text("utf-8").splitlines()
     return [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
 
 

@@ -47,6 +47,7 @@ stt talk.mp4 -f srt -o subs/             # subtitles from a video
 stt call.ogg -t absolute --tz Europe/Belgrade   # wall-clock timestamps
 stt meeting.m4a --summary --fix -f md    # LLM-corrected transcript + structured summary
 stt meeting.m4a --diarize -f speakers    # split into speaker turns
+stt dict add ConLoca --aka ConLog        # terms the model does not know
 stt archive ls                           # everything transcribed so far
 stt archive show <run-id> -f vtt         # re-render an old run, no GPU needed
 ```
@@ -62,6 +63,12 @@ stt archive show <run-id> -f vtt         # re-render an old run, no GPU needed
 
 ## Notes
 - `--summary` produces headline, topics, decisions, action items and open questions.
+- If a recording is full of product names the model mangles, add them with `stt dict add`
+  BEFORE transcribing: the glossary goes into the speech model's prompt, so it fixes
+  words at the acoustic level rather than guessing at them afterwards.
+- `--diarize` needs a one-off `stt diarize install` and `stt login diarization`; the latter
+  opens the browser, takes the Hugging Face token off the clipboard and accepts the model
+  terms. Never tell the user to export `HF_TOKEN` by hand.
 - `--fix` and `--summary` borrow an installed agent CLI (codex / claude / opencode); no API
   key of their own.
 - Runs are cached in a local archive, so re-rendering a different format is instant.

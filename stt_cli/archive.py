@@ -27,7 +27,9 @@ THE CACHE KEY IS DELIBERATELY NARROW
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -74,6 +76,28 @@ FINGERPRINT_KEYS = (
     "vad_speech_pad_ms", "vad_min_speech_ms", "clean", "strict_clean", "max_repeats",
     "confidence_floor", "variants", "variant_models", "fix", "fix_with",
 )  # fmt: skip
+
+# Settings that change the transcript but were added after the archive already had runs in
+# it. They enter the fingerprint only when set away from their default, so an existing
+# archive stays valid: at the default they decode exactly what the old code decoded, and
+# listing them unconditionally would change every stored fingerprint and quietly throw the
+# whole archive away. Anything genuinely new belongs here rather than in FINGERPRINT_KEYS.
+# Each entry MUST equal the same-named field's default on `Settings` — the whole mechanism
+# is "at the default, the fingerprint is unchanged", and that only holds while the two agree.
+# Tuning a default in config.py and leaving this table behind silently invalidates every
+# stored run on the next release. `test_the_fingerprint_defaults_match_the_real_defaults`
+# is what keeps the two files honest, since nothing else connects them.
+FINGERPRINT_DEFAULTS: dict[str, object] = {
+    "context": "off",
+    "context_compare": "off",
+    # Not the settings themselves but the dictionary's CONTENT: adding a term changes
+    # what comes out, and an empty dictionary must leave every existing run valid.
+    "dict_digest": "",
+    "dict_bias": True,
+    "dict_similarity": 0.80,
+    # "" = every engine did everything the settings asked for. See Settings.engine_limits.
+    "engine_limits": "",
+}
 
 # Things that ADD to a finished transcript rather than change it: a summary, speaker
 # labels. Asking for one of these against an already-transcribed recording must run only
@@ -124,6 +148,10 @@ class RunRecord:
 def fingerprint(settings: Settings) -> str:
     """Hash the transcript-affecting settings into the archive's identity for this run."""
     payload: dict[str, object] = {key: getattr(settings, key) for key in FINGERPRINT_KEYS}
+    for key, default in FINGERPRINT_DEFAULTS.items():
+        value = getattr(settings, key, default)
+        if value != default:
+            payload[key] = value
     payload["_decode_revision"] = DECODE_REVISION
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -356,11 +384,29 @@ class Archive:
         return int(count), audio, runs
 
 
+# Distinguishes concurrent writers inside one process; the pid distinguishes the processes.
+_writers = itertools.count()
+
+
 def write_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via a temporary neighbour, so readers never see a partial file."""
-    partial = path.with_name(path.name + ".part")
-    partial.write_text(text, "utf-8")
-    partial.replace(path)
+    """Write ``text`` to ``path`` via a temporary neighbour, so readers never see a partial file.
+
+    The neighbour's name is unique to the writer — the pid, plus a counter for the writers
+    inside one process. A shared name would let two writers interleave into one temporary
+    file and the "atomic" rename would then publish a blend of both; with the pid alone that
+    was still true of two threads in one process, where the second `replace` also found its
+    own temporary already renamed away and raised.
+
+    Unique names make concurrent writes safe, not ordered: the last rename wins and the
+    other writer's content is gone. Ordering needs a lock (see ``dictionary.editing``).
+    Every archive writer runs sequentially within a run, so nothing here needs one today.
+    """
+    partial = path.with_name(f"{path.name}.{os.getpid()}.{next(_writers)}.part")
+    try:
+        partial.write_text(text, "utf-8")
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def _record(row: sqlite3.Row) -> RunRecord:

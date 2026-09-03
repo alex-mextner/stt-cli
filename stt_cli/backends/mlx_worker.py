@@ -21,12 +21,18 @@ from typing import Any
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="one mlx-whisper decode pass")
-    parser.add_argument("--audio", required=True)
-    parser.add_argument("--model", required=True)
     parser.add_argument("--language", default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--word-timestamps", action="store_true")
     parser.add_argument("--initial-prompt", default=None)
+    parser.add_argument("--carry-context", action="store_true")
+    parser.add_argument("--carry-prompt", action="store_true")
+    # Answer what this install can do and exit, without loading a model or touching audio.
+    # The pipeline asks before it computes the cache key, because an install that cannot
+    # pin the prompt decodes a glossary run as if there were no glossary.
+    parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--audio")
+    parser.add_argument("--model")
     args = parser.parse_args(argv)
 
     try:
@@ -34,6 +40,32 @@ def main(argv: list[str]) -> int:
     except ImportError as exc:  # pragma: no cover - depends on the host environment
         json.dump({"error": f"mlx_whisper is not importable: {exc}"}, sys.stdout)
         return 1
+
+    if args.probe:
+        json.dump(
+            {"carry_initial_prompt": _accepts(mlx_whisper.transcribe, "carry_initial_prompt")},
+            sys.stdout,
+        )
+        return 0
+    if not args.audio or not args.model:
+        json.dump({"error": "--audio and --model are required unless --probe is given"}, sys.stdout)
+        return 1
+
+    extra: dict[str, Any] = {}
+    warnings: list[str] = []
+    if args.carry_prompt:
+        # Whisper drops the initial prompt after the first 30-second window unless it is
+        # re-prepended, so without this the glossary biases half a minute of a two-hour
+        # recording. `carry_initial_prompt` is the parameter that re-prepends it, and it is
+        # newer than some installed mlx-whisper builds — hence the check rather than a
+        # keyword argument that would turn an old build into a TypeError mid-run.
+        if _accepts(mlx_whisper.transcribe, "carry_initial_prompt"):
+            extra["carry_initial_prompt"] = True
+        else:
+            warnings.append(
+                "this mlx-whisper is too old for carry_initial_prompt: the glossary biases "
+                "only the first window of each chunk (upgrade mlx-whisper, or use whispercpp)"
+            )
 
     result = mlx_whisper.transcribe(
         args.audio,
@@ -44,12 +76,27 @@ def main(argv: list[str]) -> int:
         initial_prompt=args.initial_prompt,
         # The single most important switch for long recordings: with it on, one hallucinated
         # sentence is fed back in as context and the model happily continues the fiction for
-        # minutes. Off, a bad chunk stays a bad chunk.
-        condition_on_previous_text=False,
+        # minutes. Off, a bad chunk stays a bad chunk. Off is the default here; the caller
+        # turns it on only for the comparison pass that `--context-compare` runs.
+        condition_on_previous_text=args.carry_context,
         verbose=None,
+        **extra,
     )
-    json.dump(_slim(result), sys.stdout, ensure_ascii=False)
+    payload = _slim(result)
+    if warnings:
+        payload["warnings"] = warnings
+    json.dump(payload, sys.stdout, ensure_ascii=False)
     return 0
+
+
+def _accepts(function: Any, parameter: str) -> bool:
+    """Does this build of mlx-whisper take that keyword argument?"""
+    import inspect
+
+    try:
+        return parameter in inspect.signature(function).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a C or wrapped callable
+        return False
 
 
 def _slim(result: dict[str, Any]) -> dict[str, Any]:

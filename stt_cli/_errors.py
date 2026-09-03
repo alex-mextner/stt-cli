@@ -94,15 +94,22 @@ class MissingDependencyError(SttError):
     exit_code = EXIT_MISSING_DEP
 
 
-def unknown_item(kind: str, name: str, known: list[str]) -> UnknownItemError:
-    """Build an unknown-<kind> error with a did-you-mean hint drawn from ``known``."""
+def unknown_item(
+    kind: str, name: str, known: list[str], *, plural: str | None = None
+) -> UnknownItemError:
+    """Build an unknown-<kind> error with a did-you-mean hint drawn from ``known``.
+
+    ``plural`` exists because appending an "s" produces "capabilitys" and, worse, turns
+    "provider for diarization" into "provider for diarizations".
+    """
     import difflib
 
+    many = plural or f"{kind}s"
     close = difflib.get_close_matches(name, known, n=3, cutoff=0.5)
-    hint = f"did you mean: {', '.join(close)}?" if close else f"known {kind}s: {', '.join(known)}"
+    hint = f"did you mean: {', '.join(close)}?" if close else f"known {many}: {', '.join(known)}"
     return UnknownItemError(
         what=f"unknown {kind}: {name!r}",
-        why=f"{name!r} is not one of the registered {kind}s",
+        why=f"{name!r} is not one of the registered {many}",
         how=hint,
     )
 

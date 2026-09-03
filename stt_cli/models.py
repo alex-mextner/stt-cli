@@ -28,9 +28,10 @@ Flag = Literal[
     "low-confidence",  # below the confidence floor; a candidate for variants / LLM review
     "silence",  # overlaps a span VAD classified as non-speech
     "empty",  # no usable text after normalization
+    "term",  # sounds like a dictionary term; the candidates are in `suspected_terms`
 ]
 
-VariantKind = Literal["primary", "temperature", "model", "llm"]
+VariantKind = Literal["primary", "temperature", "model", "context", "llm"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -101,6 +102,12 @@ class Segment:
     speaker: str | None = None
     variants: list[Variant] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
+    # Phrases the dictionary's phonetic screen believes are misheard terms, as
+    # (heard, suspected) pairs. A field of its own rather than more strings in `flags`:
+    # these carry transcript text, and `flags` is a closed vocabulary that renderers join
+    # into one cell (`<a,b>`, `a|b`). Smuggling arbitrary words through it puts somebody's
+    # speech into a column that nothing downstream expects to have to quote.
+    suspected_terms: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -124,6 +131,8 @@ class Segment:
             out["variants"] = [v.to_dict() for v in self.variants]
         if self.flags:
             out["flags"] = list(self.flags)
+        if self.suspected_terms:
+            out["suspected_terms"] = [[heard, term] for heard, term in self.suspected_terms]
         return out
 
     @classmethod
@@ -138,6 +147,11 @@ class Segment:
             speaker=raw.get("speaker"),
             variants=[Variant.from_dict(v) for v in raw.get("variants", [])],
             flags=list(raw.get("flags", [])),
+            suspected_terms=[
+                (str(pair[0]), str(pair[1]))
+                for pair in raw.get("suspected_terms", [])
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            ],
         )
 
 

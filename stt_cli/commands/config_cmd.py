@@ -8,7 +8,6 @@ name. A flag always still wins over a stored value for a single run.
 from __future__ import annotations
 
 import argparse
-import json
 
 from .. import config
 from .._errors import EXIT_OK
@@ -45,9 +44,7 @@ def _list() -> int:
     settings = config.load_settings()
     stored = _stored()
     print(f"{'setting':<24} {'value':<28} source")
-    for name in sorted(settings.__dataclass_fields__):
-        if name in {"output", "recorded_at"}:
-            continue
+    for name in sorted(config.configurable()):
         value = getattr(settings, name)
         source = "config file" if name in stored else "default"
         print(f"{name:<24} {_show(value):<28} {source}")
@@ -56,33 +53,32 @@ def _list() -> int:
 
 
 def _stored() -> JsonDict:
-    """What is actually in config.json, so `config list` can say which values are stored."""
-    path = config.config_path()
-    if not path.is_file():
-        return {}
-    try:
-        return as_dict(json.loads(path.read_text("utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    """What is actually in config.json, so `config list` can say which values are stored.
+
+    Through `config` rather than opening the file here. The hand-rolled version checked the
+    path with `is_file()` and then opened it, and a regular file swapped for a FIFO in that
+    gap made `stt config list` block forever with no message — the one failure the shared
+    reader exists to make impossible.
+    """
+    return as_dict(config.stored())
 
 
 def _get(key: str) -> int:
     settings = config.load_settings()
-    if key not in settings.__dataclass_fields__:
+    if key not in config.configurable():
         from .._errors import unknown_item
 
-        raise unknown_item("setting", key, sorted(settings.__dataclass_fields__))
+        raise unknown_item("setting", key, sorted(config.configurable()))
     print(_show(getattr(settings, key)))
     return EXIT_OK
 
 
 def _set(key: str, raw: str) -> int:
     """Store one setting, coercing the argv string to the field's DECLARED type."""
-    settings = config.load_settings()
-    if key not in settings.__dataclass_fields__:
+    if key not in config.configurable():
         from .._errors import unknown_item
 
-        raise unknown_item("setting", key, sorted(settings.__dataclass_fields__))
+        raise unknown_item("setting", key, sorted(config.configurable()))
     value = config.coerce(key, raw)
     config.save_setting(key, value)
     print(f"{key} = {_show(value)}   ({config.config_path()})")
