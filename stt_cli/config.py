@@ -375,7 +375,10 @@ def _editing_the_settings(target: Path) -> Iterator[None]:
 
     lock = target.with_name(target.name + ".lock")
     try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NONBLOCK, 0o644)
+        # Owner only. The file holds nothing — it exists to be flocked — but there is no
+        # reason for anything else on the machine to be able to open it, and a mode that
+        # says "world readable" invites the question of what is in it.
+        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NONBLOCK, 0o600)
     except OSError as exc:
         raise UsageError(
             what=f"could not lock {target}",
