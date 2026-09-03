@@ -38,6 +38,7 @@ from pathlib import Path
 
 from . import fuzzy
 from ._errors import UsageError
+from .jsonio import ABSENT, JsonDict, in_units, read_json
 from .models import Segment, Variant
 
 FILENAME = "dictionary.json"
@@ -113,9 +114,15 @@ MAX_ALIASES = 24
 # quietly switching off for the entries near the end.
 MAX_ALIAS_BRANCHES = MAX_SCREENED_TERMS * MAX_ALIASES
 
-# Room for the largest dictionary the caps above allow, several times over, and no room for
-# a file that is not a dictionary at all. Every transcription reads this file.
-MAX_DICTIONARY_BYTES = 4 * 1024 * 1024
+# Room for the largest dictionary the caps above allow, and no room for a file that is not a
+# dictionary at all. Every transcription reads this file.
+#
+# The number has to be a byte count, and the caps above are character counts. Five hundred
+# terms each filled to `MAX_TERM_CHARS`, `MAX_ALIASES` and `NOTE_CHARS` is about a megabyte
+# of Latin text and four and a half of emoji, because a character is one byte or four
+# depending on which. It is set from the second figure, not the first, and `_serialized`
+# refuses anything that gets past it anyway.
+MAX_DICTIONARY_BYTES = 8 * 1024 * 1024
 
 
 # A note is free text the user wrote for the LLM correction pass to read, and `stt dict
@@ -190,7 +197,14 @@ def normalized(term: Term) -> Term:
         if squeezed and squeezed.casefold() not in seen:
             seen.add(squeezed.casefold())
             aka.append(squeezed)
-    return Term(term=_squeeze(term.term), aka=aka, note=_printable(term.note))
+    # The note is cut to a note's length HERE rather than only where it is printed, because
+    # this is the shape that gets saved. Truncating at the point of display left the stored
+    # file free to hold a note of any size: an import just under `MAX_IMPORT_BYTES` carrying
+    # one enormous `#` comment was accepted, written out, and then refused by `load()` for
+    # being over `MAX_DICTIONARY_BYTES` — every transcription failing on a file the import
+    # had reported as a success. With the note bounded here, the three caps on terms,
+    # aliases and notes together bound the file, so that shape cannot be written at all.
+    return Term(term=_squeeze(term.term), aka=aka, note=_as_a_note(_printable(term.note)))
 
 
 def _squeeze(text: str) -> str:
@@ -431,26 +445,18 @@ def path() -> Path:
 def load() -> Dictionary:
     """The user's dictionary, or an empty one. A malformed file is an error, not a shrug."""
     target = path()
-    if not target.is_file():
+    # Bounded, because this file is read by EVERY transcription and can be replaced by
+    # anything: a few hundred megabytes of JSON was parsed, normalized and serialized again
+    # for the cache digest before a second of audio was touched. The import path was already
+    # bounded; the file it writes to was not.
+    raw = read_json(
+        target,
+        how="fix the JSON, save it as UTF-8, or delete the file to start empty",
+        limit=MAX_DICTIONARY_BYTES,
+        too_big=f"a dictionary holds at most {MAX_SCREENED_TERMS} names, not a corpus",
+    )
+    if raw is ABSENT:
         return Dictionary()
-    try:
-        # Bounded, because this file is read by EVERY transcription and can be replaced by
-        # anything: a few hundred megabytes of JSON was parsed, normalized and serialized
-        # again for the cache digest before a second of audio was touched. The import path
-        # was already bounded; the file it writes to was not.
-        if target.stat().st_size > MAX_DICTIONARY_BYTES:
-            raise UsageError(
-                what=f"{target} is larger than {MAX_DICTIONARY_BYTES // (1024 * 1024)} MiB",
-                why=f"a dictionary holds at most {MAX_SCREENED_TERMS} names, not a corpus",
-                how="trim it, or delete it to start with an empty dictionary",
-            )
-        raw = json.loads(target.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise UsageError(
-            what=f"could not read {target}",
-            why=str(exc),
-            how="fix the JSON, or delete the file to start with an empty dictionary",
-        ) from exc
     entries = raw.get("terms") if isinstance(raw, dict) else None
     if not isinstance(entries, list):
         raise UsageError(
@@ -516,8 +522,31 @@ def save(dictionary: Dictionary) -> Path:
     config.ensure_dirs()
     target = path()
     payload = {"terms": [term.to_dict() for term in dictionary.terms]}
-    write_atomic(target, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    write_atomic(target, _serialized(payload))
     return target
+
+
+def _serialized(payload: dict[str, list[JsonDict]]) -> str:
+    """The file, refused here if `load()` would refuse it.
+
+    The caps on terms, aliases and notes are counted in CHARACTERS, because that is the unit
+    the user was given ("at most 80 characters"), and the file is measured in BYTES. For a
+    Latin dictionary those are the same number; for one written in emoji they differ by four,
+    and a glossary filled to every character cap with four-byte characters serialized past
+    `MAX_DICTIONARY_BYTES` — an import that reported success and left every later run failing
+    on a file nothing would load. `MAX_DICTIONARY_BYTES` is set so that dictionary fits; this
+    check is what makes the guarantee hold whatever the caps become, by moving the failure to
+    the write that causes it instead of to every read that follows.
+    """
+    blob = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if len(blob.encode("utf-8")) > MAX_DICTIONARY_BYTES:
+        raise UsageError(
+            what="the dictionary would be too large to read back",
+            why=f"it serializes to more than {in_units(MAX_DICTIONARY_BYTES)},"
+            f" which is the size `stt` refuses to load",
+            how="shorten the longest notes and aliases, or split the glossary in two",
+        )
+    return blob
 
 
 @contextmanager

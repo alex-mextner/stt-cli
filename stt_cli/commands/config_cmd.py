@@ -8,7 +8,6 @@ name. A flag always still wins over a stored value for a single run.
 from __future__ import annotations
 
 import argparse
-import json
 
 from .. import config
 from .._errors import EXIT_OK
@@ -54,14 +53,14 @@ def _list() -> int:
 
 
 def _stored() -> JsonDict:
-    """What is actually in config.json, so `config list` can say which values are stored."""
-    path = config.config_path()
-    if not path.is_file():
-        return {}
-    try:
-        return as_dict(json.loads(path.read_text("utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    """What is actually in config.json, so `config list` can say which values are stored.
+
+    Through `config` rather than opening the file here. The hand-rolled version checked the
+    path with `is_file()` and then opened it, and a regular file swapped for a FIFO in that
+    gap made `stt config list` block forever with no message — the one failure the shared
+    reader exists to make impossible.
+    """
+    return as_dict(config.stored())
 
 
 def _get(key: str) -> int:

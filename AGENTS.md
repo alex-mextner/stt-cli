@@ -35,9 +35,13 @@ async. Zero required third-party runtime dependencies.
 
 ## Invariants
 
-- **Import-clean at the top.** `cli.py` and every command module import only the standard
-  library at module level. Heavy or optional imports (`mlx_whisper`, `pyannote`, `torch`)
-  happen inside the function that needs them, so `stt --help` works on a bare machine.
+- **Import-clean at the top.** `cli.py` and every command module import, at module level,
+  only the standard library and first-party modules that are themselves standard-library
+  only. Third-party imports (`mlx_whisper`, `pyannote`, `torch`) happen inside the function
+  that needs them, so `stt --help` works on a bare machine. The guarantee is about what a
+  bare machine has installed, not about the shape of the internal import graph: `cli.py`
+  imports every command module to build the help text, so a module-level `from .. import
+  pipeline` is fine and a module-level `import torch` is not.
 - **Zero required runtime dependencies.** Anything heavy is an optional extra installed on
   demand. Do not add a `dependencies` entry to `pyproject.toml` without a very good reason.
 - **Every external process in the transcription path goes through `proc.run`.** It has a
@@ -56,9 +60,13 @@ async. Zero required third-party runtime dependencies.
   every setting that changes the transcript, and must not list output format or timestamp
   mode, because those re-render from the archive.
 - **Cleaning never deletes silently.** Flag first, drop second, always report what went.
-- **Every boolean CLI switch is a `BooleanOptionalAction` defaulting to `None`.** A
-  `store_true` can only turn something on, which makes a stored preference impossible to
-  override, and an unmentioned flag would overwrite a stored value with `False`.
+- **Every boolean CLI switch a stored preference can supply is a `BooleanOptionalAction`
+  defaulting to `None`.** A `store_true` can only turn something on, which makes a stored
+  preference impossible to override, and an unmentioned flag would overwrite a stored value
+  with `False`. A switch that is only ever a decision about the single invocation in front
+  of you — `--yes`, `--quiet`, `--force`, `--status` — has nothing stored behind it to
+  overwrite and stays a plain `store_true`; the test is whether `config` can hold a value
+  for it, not whether the type happens to be a boolean.
 - **Render options come from the merged `Settings`, never straight from argv** — otherwise a
   stored preference is silently dead, and an enrichment left on an archived transcript (a
   summary, speaker labels) leaks into a run that did not ask for it.

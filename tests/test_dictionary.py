@@ -7,10 +7,15 @@ The tests below are built out of those exact strings rather than invented ones.
 
 from __future__ import annotations
 
+import json
+import os
+from contextlib import contextmanager
+from pathlib import Path
+
 import pytest
 
 from stt_cli import dictionary, fuzzy
-from stt_cli._errors import EXIT_OK, EXIT_UNKNOWN_ITEM, UsageError
+from stt_cli._errors import EXIT_OK, EXIT_UNKNOWN_ITEM, EXIT_USAGE, UsageError
 from stt_cli.cli import main
 from stt_cli.models import Segment
 
@@ -1028,7 +1033,11 @@ def test_a_dictionary_file_the_size_of_a_corpus_is_refused(monkeypatch) -> None:
     before a second of audio was touched. The import path was bounded; its target was not."""
     monkeypatch.setattr(dictionary, "MAX_DICTIONARY_BYTES", 64)
     dictionary.path().parent.mkdir(parents=True, exist_ok=True)
-    dictionary.save(dictionary.Dictionary([_term(f"Term{n}") for n in range(20)]))
+    # Written past `save()` on purpose. `save()` now refuses to produce a file this size, so
+    # a file this size can only have arrived the way this test is describing: from outside.
+    dictionary.path().write_text(
+        json.dumps({"terms": [_term(f"Term{n}").to_dict() for n in range(20)]}), "utf-8"
+    )
 
     with pytest.raises(UsageError) as raised:
         dictionary.load()
@@ -1055,3 +1064,422 @@ def test_an_alias_written_without_its_brackets_is_refused(capsys) -> None:
         assert main(["dict", "add", "ConLoca"]) == EXIT_USAGE
         capsys.readouterr()
         assert json.loads(dictionary.path().read_text("utf-8")) == json.loads(bad)
+
+
+def test_a_dictionary_saved_in_the_wrong_encoding_is_diagnosed(capsys) -> None:
+    """An editor that saved the file as Latin-1, or a copy truncated mid-character, is not
+    valid UTF-8 at all — `read_text` raises before the JSON parser is reached. Uncaught, that
+    surfaced as a raw traceback and exit code 1 from an ordinary `stt recording.m4a`, because
+    the dictionary is loaded on the default path."""
+    dictionary.path().parent.mkdir(parents=True, exist_ok=True)
+    dictionary.path().write_bytes('{"terms": [{"term": "Фигма"}]}'.encode("cp1251"))
+
+    with pytest.raises(UsageError) as raised:
+        dictionary.load()
+    assert "could not read" in raised.value.what
+    assert main(["dict", "list"]) == EXIT_USAGE
+    assert "UTF-8" in capsys.readouterr().err
+
+
+def test_a_note_is_cut_to_a_note_before_it_is_saved() -> None:
+    """A glossary just under the import cap carrying one enormous note was accepted, written
+    out, and then refused by `load()` for being over `MAX_DICTIONARY_BYTES` — every
+    transcription failing on a file the import had called a success. Truncating only where
+    the note is printed left the stored file unbounded."""
+    saved = dictionary.Dictionary()
+    saved.add(_term("Figma", note="a design tool " * 200))
+    dictionary.save(saved)
+
+    stored = dictionary.load().terms[0].note
+    assert len(stored) <= dictionary.NOTE_CHARS
+    assert stored.endswith("…"), "the cut is visible, not silent"
+    assert stored.startswith("a design tool")
+
+
+def test_the_caps_together_bound_the_file_the_loader_will_accept() -> None:
+    """The point of bounding the note: a dictionary filled to every limit the commands allow
+    must still be a file `load()` reads back. It is measured against what `save()` actually
+    writes, and in the widest characters Unicode has — the caps count CHARACTERS and the file
+    is measured in BYTES, so a glossary written in emoji is four times the size of the same
+    glossary written in Latin, and it was the emoji one that did not fit."""
+    import json
+
+    widest = dictionary.Term(
+        term="\U0001f600" * dictionary.MAX_TERM_CHARS,
+        aka=[
+            chr(0x1F300 + n) + "\U0001f600" * (dictionary.MAX_TERM_CHARS - 1)
+            for n in range(dictionary.MAX_ALIASES)
+        ],
+        note="\U0001f600" * (dictionary.NOTE_CHARS * 4),
+    )
+    one = dictionary.normalized(widest).to_dict()
+    whole = json.dumps(
+        {"terms": [one] * dictionary.MAX_SCREENED_TERMS}, ensure_ascii=False, indent=2
+    )
+    assert len(whole.encode("utf-8")) < dictionary.MAX_DICTIONARY_BYTES
+
+
+def test_a_dictionary_too_big_to_read_back_is_refused_at_the_write() -> None:
+    """The character caps are the first defence and cannot be the only one: they count
+    characters, the file is counted in bytes, and the ratio between the two is whatever
+    alphabet the user writes in. Before this, a glossary that crossed the line imported
+    successfully and then failed EVERY later run, on a file nothing would load. The failure
+    now happens at the write that causes it."""
+    monkey = dictionary.Dictionary([_term(f"Term{n}", note="и" * 100) for n in range(30)])
+    original = dictionary.MAX_DICTIONARY_BYTES
+    dictionary.MAX_DICTIONARY_BYTES = 512
+    try:
+        with pytest.raises(UsageError) as raised:
+            dictionary.save(monkey)
+        assert "too large to read back" in raised.value.what
+        assert not dictionary.path().exists(), "and nothing was written"
+    finally:
+        dictionary.MAX_DICTIONARY_BYTES = original
+
+
+def test_a_config_saved_in_the_wrong_encoding_is_diagnosed(capsys) -> None:
+    """`config.json` is read on the default path, before the dictionary is. The same editor
+    that saves one as Latin-1 saves the other, and this one answered `stt rec.m4a` with a
+    traceback for exactly as long as nobody tried it."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    config.config_path().write_bytes('{"language": "рус"}'.encode("cp1251"))
+
+    with pytest.raises(UsageError) as raised:
+        config.load_settings()
+    assert "could not read" in raised.value.what
+    assert main(["config", "list"]) == EXIT_USAGE
+    assert "UTF-8" in capsys.readouterr().err
+
+
+def test_a_hallucination_list_saved_in_the_wrong_encoding_is_diagnosed() -> None:
+    """The third user-editable file on the default path, and the one that is not JSON."""
+    from stt_cli import config, phrases
+
+    config.ensure_dirs()
+    home = config.app_home()
+    phrases.user_patterns_path(home).write_bytes("продолжение следует".encode("cp1251"))
+
+    with pytest.raises(UsageError) as raised:
+        phrases.load_user_patterns(home)
+    assert "UTF-8" in raised.value.how
+
+
+def test_a_config_that_is_not_an_object_is_refused_by_the_writer_too(capsys) -> None:
+    """`config list` called a `config.json` holding `[]` broken while `config set` quietly
+    replaced it with a fresh object. One command diagnosing the file and the other one
+    destroying it is worse than either alone, because the diagnosis stops being a warning."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    config.config_path().write_text("[1, 2]", "utf-8")
+
+    assert main(["config", "set", "language", "en"]) == EXIT_USAGE
+    capsys.readouterr()
+    assert config.config_path().read_text("utf-8") == "[1, 2]", "and it is still there"
+
+
+def test_a_dictionary_that_cannot_be_opened_is_diagnosed(monkeypatch) -> None:
+    """A file that exists and refuses to be read. It has to answer the way every other
+    unreadable dictionary answers, not as an internal error out of the open."""
+    dictionary.path().parent.mkdir(parents=True, exist_ok=True)
+    dictionary.save(dictionary.Dictionary([_term("Figma")]))
+
+    def refused(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "open", refused)
+    with pytest.raises(UsageError) as raised:
+        dictionary.load()
+    assert "could not read" in raised.value.what
+
+
+def test_a_dictionary_swapped_for_a_pipe_does_not_hang_the_run() -> None:
+    """The bound was checked by asking the PATH how big it was and then opening it, which is
+    two moments with a gap. A FIFO in that gap made the open wait for a writer that never
+    came — every transcription hanging with no message, on the file every run reads."""
+    dictionary.path().parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(dictionary.path())
+
+    assert dictionary.load().terms == [], "not a file, so not a dictionary — and no waiting"
+
+
+def test_json_nested_past_the_parser_is_diagnosed() -> None:
+    """Valid JSON, nested past what the parser's stack can hold. That is neither a decode
+    error nor an `OSError`; it is the parser running out of room, and it escaped as a
+    traceback from an ordinary run."""
+    depth = 20_000
+    dictionary.path().parent.mkdir(parents=True, exist_ok=True)
+    dictionary.path().write_text("[" * depth + "0" + "]" * depth, "utf-8")
+
+    with pytest.raises(UsageError) as raised:
+        dictionary.load()
+    assert "nested too deeply" in raised.value.why
+
+
+def test_a_hallucination_list_that_cannot_be_read_is_not_silently_empty(monkeypatch) -> None:
+    """Returning an empty list here would drop the user's own always-drop patterns from a run
+    that then looks like it worked — the same output change as deleting the file, with no
+    word about it anywhere."""
+    from stt_cli import config, phrases
+
+    config.ensure_dirs()
+    home = config.app_home()
+    phrases.user_patterns_path(home).write_text("продолжение следует\n", "utf-8")
+
+    def refused(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "open", refused)
+    with pytest.raises(UsageError):
+        phrases.load_user_patterns(home)
+
+
+def test_a_dictionary_file_holding_null_is_not_mistaken_for_no_file() -> None:
+    """JSON has a `null` of its own, and for one round `read_json` answered with the same
+    `None` it used for "there is no file". A `dictionary.json` containing those four
+    characters was read as an empty dictionary and every run after it quietly decoded with no
+    terminology — the only malformed shape that was not diagnosed."""
+    dictionary.path().parent.mkdir(parents=True, exist_ok=True)
+    dictionary.path().write_text("null", "utf-8")
+
+    with pytest.raises(UsageError) as raised:
+        dictionary.load()
+    assert "is not a dictionary" in raised.value.what
+
+
+def test_a_config_file_holding_null_is_refused_rather_than_ignored() -> None:
+    """The same shape, in the other file read on the default path."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    config.config_path().write_text("null", "utf-8")
+
+    with pytest.raises(UsageError) as raised:
+        config.load_settings()
+    assert "is not a settings file" in raised.value.what
+
+
+def test_a_number_too_long_to_convert_is_diagnosed() -> None:
+    """Five thousand digits is perfectly good JSON, and Python refuses to turn it into an int
+    with a plain `ValueError` — not a decode error, not an `OSError`. It escaped as a
+    traceback from an ordinary run for exactly as long as nobody wrote one down."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    config.config_path().write_text('{"threads": ' + "9" * 5000 + "}", "utf-8")
+
+    with pytest.raises(UsageError) as raised:
+        config.load_settings()
+    assert "could not read" in raised.value.what
+
+
+def test_listing_settings_does_not_wait_on_a_pipe() -> None:
+    """`config list` used to check the path and then open it, and a regular file swapped for a
+    FIFO in that gap blocked forever with no message. It reads through the same guarded door
+    as everything else now."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    os.mkfifo(config.config_path())
+
+    assert main(["config", "list"]) == EXIT_OK
+
+
+def test_config_set_cannot_write_a_file_it_will_then_refuse(monkeypatch) -> None:
+    """A config just under the limit loads fine; `config set` re-serializes it with
+    indentation and one more key and crosses the line. The command used to report success and
+    every `stt` invocation after it failed before doing any work."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    monkeypatch.setattr(config, "MAX_CONFIG_BYTES", 330)
+    config.config_path().write_text(json.dumps({"formats": "txt" * 100}), "utf-8")
+    before = config.config_path().read_text("utf-8")
+
+    with pytest.raises(UsageError) as raised:
+        config.save_setting("language", "ru")
+    assert "too large to read back" in raised.value.what
+    assert config.config_path().read_text("utf-8") == before
+
+
+def test_a_size_limit_is_reported_in_the_unit_it_is_in() -> None:
+    """ "larger than 0 MiB" is not a sentence anybody can act on."""
+    from stt_cli.jsonio import in_units
+
+    assert in_units(256 * 1024) == "256 KiB"
+    assert in_units(8 * 1024 * 1024) == "8 MiB"
+
+
+def test_a_file_that_grows_after_it_is_measured_is_still_refused() -> None:
+    """The size the descriptor reports is a snapshot. Another process appending between the
+    measurement and the read left a file over the limit being parsed as if it were under it,
+    because reading exactly the limit can never notice there was more."""
+    from pathlib import Path
+
+    from stt_cli.jsonio import read_json
+
+    target = Path(str(dictionary.path()) + ".grown")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}", "utf-8")
+
+    real_fstat = os.fstat
+
+    def understated(fd):
+        info = real_fstat(fd)
+        target.write_text("{}" + " " * 100, "utf-8")
+        return info
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fstat", understated)
+        with pytest.raises(UsageError) as raised:
+            read_json(target, how="", limit=32, too_big="")
+    assert "larger than" in raised.value.what
+
+
+def test_config_set_refuses_to_write_over_something_that_is_not_a_file() -> None:
+    """The reader treats anything that is not a regular file as "there is no config", which
+    is right for reading and leaves the writer in front of whatever IS there. Opening a FIFO
+    for writing waits for a reader that never comes — `stt config set` hanging with no
+    message — and a directory raises out of the middle of the write."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    os.mkfifo(config.config_path())
+    with pytest.raises(UsageError) as raised:
+        config.save_setting("language", "ru")
+    assert "not a settings file" in raised.value.what
+    config.config_path().unlink()
+
+    config.config_path().mkdir()
+    with pytest.raises(UsageError):
+        config.save_setting("language", "ru")
+
+
+def test_config_set_still_works_on_an_ordinary_file() -> None:
+    """The other half: refusing strange targets must not refuse the normal one."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    config.save_setting("language", "ru")
+    assert config.load_settings().language == "ru"
+    assert config.config_path().is_file()
+
+
+def test_a_config_symlinked_into_a_dotfiles_checkout_stays_a_symlink(tmp_path) -> None:
+    """Keeping `config.json` as a link into a dotfiles repository is an ordinary thing to do.
+    The reader always followed the link; the writer has to as well, and it has to write
+    THROUGH it — an atomic write is a rename, and onto the link itself it would replace the
+    link with a regular file and quietly detach the config from the repository."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    real = tmp_path / "dotfiles-stt-config.json"
+    real.write_text('{"language": "en"}', "utf-8")
+    config.config_path().symlink_to(real)
+
+    assert config.load_settings().language == "en"
+    config.save_setting("language", "ru")
+
+    assert config.config_path().is_symlink(), "the link survived the write"
+    assert json.loads(real.read_text("utf-8"))["language"] == "ru"
+    assert config.load_settings().language == "ru"
+
+
+def test_a_second_config_writer_waits_for_the_first_to_finish() -> None:
+    """Reading the whole file, changing one key and writing the whole file back is not one
+    operation. Two terminals running `stt config set` both read the old object, and whichever
+    renames last stores a version that never saw the other's key — gone, with no error. The
+    lock is what makes the pair one operation, so the test is that the second writer waits."""
+    import threading
+
+    from stt_cli import config
+
+    config.ensure_dirs()
+    config.save_setting("language", "en")
+    done = threading.Event()
+
+    def other_terminal() -> None:
+        config.save_setting("model", "medium")
+        done.set()
+
+    resolved = Path(os.path.realpath(config.config_path()))
+    with config._editing_the_settings(resolved):
+        writer = threading.Thread(target=other_terminal, daemon=True)
+        writer.start()
+        assert not done.wait(timeout=0.5), "it wrote while the lock was held"
+
+    assert done.wait(timeout=5), "and it went through once the lock was released"
+    writer.join(timeout=5)
+    settled = config.load_settings()
+    assert settled.language == "en" and settled.model == "medium"
+
+
+def test_a_config_symlink_repointed_mid_write_cannot_redirect_it() -> None:
+    """The link is resolved once, at the top, and the check, the lock, the read and the write
+    all happen on that one resolved target. Reading through the link and resolving it again
+    later left a gap: repoint it in between and the command writes the contents it read from
+    one file over a completely different one."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    home = config.app_home()
+    mine, theirs = home / "mine.json", home / "theirs.json"
+    mine.write_text('{"language": "en"}', "utf-8")
+    theirs.write_text("not mine at all", "utf-8")
+    config.config_path().symlink_to(mine)
+
+    real = config._settings_object
+
+    def repoint_the_link(path):
+        raw = real(path)
+        config.config_path().unlink()
+        config.config_path().symlink_to(theirs)  # the swap, between the read and the write
+        return raw
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(config, "_settings_object", repoint_the_link)
+        config.save_setting("language", "ru")
+
+    assert theirs.read_text("utf-8") == "not mine at all", "the other file was not touched"
+    assert json.loads(mine.read_text("utf-8"))["language"] == "ru"
+
+
+def test_two_homes_pointing_at_one_config_take_the_same_lock(tmp_path) -> None:
+    """Locking beside the LINK rather than beside the target meant two `STT_HOME`s whose
+    `config.json` points at the same dotfiles file took two different locks and did not
+    exclude each other at all — which is the whole failure the lock was added to prevent."""
+    from stt_cli import config
+
+    shared = tmp_path / "dotfiles.json"
+    shared.write_text("{}", "utf-8")
+    locked: list[Path] = []
+
+    @contextmanager
+    def remember(target: Path):
+        locked.append(target)
+        yield
+
+    for home in ("one", "two"):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("STT_HOME", str(tmp_path / home))
+            config.ensure_dirs()
+            config.config_path().symlink_to(shared)
+            patch.setattr(config, "_editing_the_settings", remember)
+            config.save_setting("language", "ru")
+
+    assert len(set(locked)) == 1, f"two homes, one lock target: {locked}"
+
+
+def test_a_lock_file_that_is_not_a_file_is_diagnosed_rather_than_waited_on() -> None:
+    """A lock file is a file like any other. A named pipe sitting where it goes would have
+    hung `stt config set` forever, on the very line that was added to make it safe."""
+    from stt_cli import config
+
+    config.ensure_dirs()
+    os.mkfifo(str(config.config_path()) + ".lock")
+
+    with pytest.raises(UsageError) as raised:
+        config.save_setting("language", "ru")
+    assert "could not lock" in raised.value.what
