@@ -7,6 +7,7 @@ than a careful reader, so they get one apiece with the failing scenario in the n
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 from datetime import datetime
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from stt_cli import formats
+from stt_cli import proc as proc_mod
 from stt_cli.archive import (
     ENRICHMENTS,
     FINGERPRINT_KEYS,
@@ -320,6 +322,15 @@ def test_two_writers_in_one_process_do_not_take_each_others_temporary(tmp_path) 
     assert list(tmp_path.glob("*.part")) == [], "no temporary is left behind"
 
 
+def _answers(value):
+    """A stand-in for an async predicate, since `monkeypatch` cannot make a lambda awaitable."""
+
+    async def said(*args, **kwargs):
+        return value
+
+    return said
+
+
 async def test_the_hugging_face_token_never_reaches_a_command_line(monkeypatch) -> None:
     """A command line is public. Any user on the machine can read another process's argv out
     of `ps`, and diarizing an hour of audio keeps the process alive long enough to be caught
@@ -337,7 +348,8 @@ async def test_the_hugging_face_token_never_reaches_a_command_line(monkeypatch) 
         seen["env"] = kwargs.get("env")
         return proc.Result(code=0, stdout='{"turns": []}', stderr="", argv=list(argv))
 
-    monkeypatch.setattr(diarize, "runner", lambda: ["/usr/bin/python3"])
+    monkeypatch.setattr(diarize, "runner", lambda **_: ["/usr/bin/python3"])
+    monkeypatch.setattr(diarize, "ready", _answers(True))
     monkeypatch.setattr(diarize, "require_token", lambda: "hf_secret_value")
     monkeypatch.setattr(proc, "run", remember)
 
@@ -439,7 +451,8 @@ async def test_diarization_that_runs_too_long_says_so_rather_than_crashing(
 
     audio = tmp_path / "long.wav"
     audio.write_bytes(b"\x00" * 32_000)
-    monkeypatch.setattr(diarize, "runner", lambda: ["/usr/bin/python3"])
+    monkeypatch.setattr(diarize, "runner", lambda **_: ["/usr/bin/python3"])
+    monkeypatch.setattr(diarize, "ready", _answers(True))
     monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
     monkeypatch.setattr(proc, "run", never_finishes)
 
@@ -472,3 +485,95 @@ def test_the_diarization_budget_follows_the_length_of_the_recording(tmp_path) ->
     assert _long_enough_for(tmp_path / "gone.wav") == MINIMUM_TIMEOUT, (
         "a missing file is not a crash"
     )
+
+
+async def test_diarizing_never_downloads_two_gigabytes_on_its_own(monkeypatch, tmp_path) -> None:
+    """The status probe was made offline; the WORK path was left online, which is where it
+    would have hurt. `stt recording.wav --diarize` on a cold cache would have resolved and
+    downloaded two and a half gigabytes inside somebody's transcription — with both streams
+    captured, so not even a progress bar reached them. The download belongs to
+    `stt diarize install`, where it was asked for and can be watched."""
+    from stt_cli import diarize
+    from stt_cli._errors import MissingDependencyError
+
+    ran: list[list[str]] = []
+
+    async def refuse(argv, **kwargs):
+        ran.append(list(argv))
+        raise AssertionError("nothing may be launched when the wheels are not ready")
+
+    monkeypatch.setattr(diarize, "runner", lambda **_: ["/opt/uv", "run", "--quiet", "python"])
+    monkeypatch.setattr(diarize, "ready", _answers(False))
+    monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
+    monkeypatch.setattr(proc_mod, "run", refuse)
+
+    with pytest.raises(MissingDependencyError) as refused:
+        await diarize.diarize(tmp_path / "recording.wav")
+    assert "not ready" in refused.value.what
+    assert ran == [], "and it did not reach for the network to find that out"
+
+
+def test_uv_is_never_allowed_to_adopt_the_directory_the_user_stood_in(monkeypatch) -> None:
+    """A bare `uv run` discovers a pyproject.toml in the current directory and synchronises
+    that project first. Run `stt something.wav --diarize` from inside an unrelated Python
+    project and uv creates ITS .venv and fails resolving ITS dependencies, which have nothing
+    to do with diarization."""
+    from stt_cli import diarize, proc
+
+    monkeypatch.setattr(proc, "which", lambda name: "/opt/uv" if name == "uv" else None)
+    argv = diarize.runner(force_uv=True)
+
+    assert argv is not None
+    assert "--no-project" in argv, "stt is not a member of anybody's workspace"
+    assert argv.index("--no-project") < argv.index("--with"), "before the wheels it asks for"
+
+
+def test_a_broken_local_pyannote_does_not_capture_the_install(monkeypatch) -> None:
+    """`find_spec` succeeds for a package that cannot actually import — a Python upgrade
+    leaving an incompatible torch wheel is the ordinary way. `stt diarize install` would then
+    have re-run the same failing import forever instead of preparing the environment that
+    works."""
+    import importlib.util
+
+    from stt_cli import diarize, proc
+
+    monkeypatch.setattr(proc, "which", lambda name: "/opt/uv" if name == "uv" else None)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+
+    command = diarize.install_command()
+
+    assert command is not None
+    assert command[0] == "/opt/uv", "the install prepares uv's environment, not the broken one"
+
+
+async def test_a_local_pyannote_is_still_enough_on_its_own(monkeypatch, tmp_path) -> None:
+    """Gating the work path on `ready()` must not shut out the setup that never needed uv.
+
+    Somebody who installed pyannote into stt's own interpreter had diarization working before
+    the gate existed. It keeps working only because `ready()` asks the SAME `runner()` — and
+    because `_offline` leaves a direct interpreter alone rather than handing it a uv flag it
+    would not understand. Every other test here replaces `ready()` with a constant, so this
+    is the one that exercises the branch.
+    """
+    from stt_cli import diarize, proc
+
+    launched: list[list[str]] = []
+
+    async def answer(argv, **kwargs):
+        launched.append(list(argv))
+        payload = '{"ready": true}' if "--probe" in argv else '{"turns": []}'
+        return proc.Result(code=0, stdout=payload, stderr="", argv=list(argv))
+
+    # pyannote is importable here, and there is no uv on this machine at all.
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(proc, "which", lambda name: None)
+    monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
+    monkeypatch.setattr(proc, "run", answer)
+
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"\x00" * 32_000)
+    assert await diarize.diarize(audio) == []
+
+    assert len(launched) == 2, "it probed, then it worked"
+    assert launched[0][0] == sys.executable, "asking the interpreter that has pyannote"
+    assert "--offline" not in launched[0], "a uv flag has no meaning for a direct interpreter"

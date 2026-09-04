@@ -78,7 +78,7 @@ class Turn:
 WHEELS = ("pyannote.audio", "torch")
 
 
-def runner() -> list[str] | None:
+def runner(*, force_uv: bool = False) -> list[str] | None:
     """The interpreter that will run the worker: ours if it already has pyannote, else uv's.
 
     NOTHING IS INSTALLED ANYWHERE. This used to `pip install` into `sys.executable`, which on
@@ -94,18 +94,25 @@ def runner() -> list[str] | None:
     import importlib.util
     import sys
 
-    try:
-        if importlib.util.find_spec("pyannote.audio") is not None:
-            return [sys.executable]
-    except (ImportError, ModuleNotFoundError, ValueError):
-        pass  # the parent package is absent, which is the ordinary case
+    if not force_uv:
+        try:
+            if importlib.util.find_spec("pyannote.audio") is not None:
+                return [sys.executable]
+        except (ImportError, ModuleNotFoundError, ValueError):
+            pass  # the parent package is absent, which is the ordinary case
     uv = proc.which("uv")
     if uv is None:
         return None
     supply: list[str] = []
     for wheel in WHEELS:
         supply += ["--with", wheel]
-    return [uv, "run", "--quiet", *supply, "python"]
+    # `--no-project` because otherwise uv looks for a pyproject.toml in the CURRENT
+    # DIRECTORY and synchronises whatever it finds: run `stt something.wav --diarize` from
+    # inside an unrelated Python project and uv creates that project's `.venv` and then fails
+    # resolving its dependencies, which have nothing to do with diarization and everything to
+    # do with where the user happened to be standing. stt is not a member of anybody's
+    # workspace; it wants an environment holding two wheels and nothing else.
+    return [uv, "run", "--quiet", "--no-project", *supply, "python"]
 
 
 def install_command() -> list[str] | None:
@@ -115,7 +122,12 @@ def install_command() -> list[str] | None:
     visibly, when the user asked for it — rather than in the middle of their first
     transcription. There is nothing to uninstall afterwards but a uv cache entry.
     """
-    argv = runner()
+    # The uv route, always, when uv is there. `ready()` has already said no by the time this
+    # is called, and a "no" from a direct interpreter that HAS pyannote means that pyannote
+    # is broken — a Python upgrade leaving an incompatible torch wheel behind is the ordinary
+    # way. Re-running the same failing import would have been the whole of `stt diarize
+    # install` in that case; preparing the uv environment is the thing that helps.
+    argv = runner(force_uv=True) or runner()
     if argv is None:
         return None
     return [*argv, "-c", "import pyannote.audio, torch"]
@@ -187,6 +199,17 @@ async def diarize(wav: Path, *, speakers: int | None = None) -> list[Turn]:
         raise MissingDependencyError(
             what="speaker diarization is not available",
             why="pyannote.audio is not importable here and uv is not installed to supply it",
+            how=INSTALL_HINT,
+        )
+    # Asked before any work, and this is not belt-and-braces. The runner is an ONLINE
+    # `uv run --with`, so reaching it with a cold cache resolves and downloads two and a half
+    # gigabytes — inside somebody's transcription, with both streams captured, so not even a
+    # progress bar reaches them. The download belongs to `stt diarize install`, where it was
+    # asked for and can be watched.
+    if not await ready():
+        raise MissingDependencyError(
+            what="speaker diarization is not ready",
+            why="the wheels are not in place, and fetching them is not this command's job",
             how=INSTALL_HINT,
         )
     token = require_token()
