@@ -237,7 +237,14 @@ class Typist:
     abandoned: bool = False
     # Held for the length of ONE keystroke, and by `disown` for the length of setting a flag.
     # See `_still_ours` for what it closes and why it is safe to make the tap's thread wait.
-    _keyboard: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    #
+    # REENTRANT, and that is not a detail. The race this closes is between two THREADS — the
+    # event tap's and the loop's — and a plain `Lock` closes it exactly as well. But a plain
+    # one also deadlocks a caller that reaches `disown` from inside a keystroke on the SAME
+    # thread, which is how the suite simulates a click landing mid-edit, and the whole test
+    # file hung. Production never reenters (posting an event does not call back into this
+    # module), so the reentrancy costs nothing and the cross-thread guarantee is unchanged.
+    _keyboard: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def begin(self) -> None:
         """A new sentence has started being spoken. Deliberately does NOT let go of the text.

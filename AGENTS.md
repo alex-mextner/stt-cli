@@ -195,6 +195,18 @@ whether or not the code they named was there — they asserted on the machinery 
 the path through it, which is the shape this mistake takes every time. A test that survives
 the deletion of its own fix is guarding nothing, and the only way to find out is to try.
 
+**Read the exit code of the command, not of the pipe.** `pytest -q | tail -3` reports
+`tail`'s status, which is always zero, and the truncation hides the "N passed" line that would
+have contradicted it. Four runs were reported here as passing on that basis while a test was
+deadlocking; CI then hung for forty minutes on both Python versions and found it instead.
+Redirect to a file, print `$?` immediately, and look at the summary line:
+`pytest -q > /tmp/out.txt 2>&1; echo "PYTEST=$?"; tail -2 /tmp/out.txt`.
+
+**A lock the tests can reach twice on one thread must be an `RLock`.** `Typist._keyboard`
+guards a race between the event tap's thread and the loop's, so a plain `Lock` closes it —
+and deadlocks the suite, which simulates a click mid-edit by calling `disown` from inside a
+fake keyboard's keystroke, on the same thread. Production never reenters; the tests must.
+
 **Clear `__pycache__` before believing a result you are surprised by.** Python decides a
 cached `.pyc` is current from the source's size and mtime, and a rewrite that lands inside the
 same clock tick at the same size does not always invalidate it. That cost half an hour here:
