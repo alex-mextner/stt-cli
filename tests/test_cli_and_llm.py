@@ -7,7 +7,10 @@ a failed pass, never an exception.
 
 from __future__ import annotations
 
+import re
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -205,3 +208,145 @@ def test_config_offers_exactly_the_settings_it_will_accept(capsys) -> None:
         assert main(["config", "get", name]) == EXIT_UNKNOWN_ITEM
         assert main(["config", "set", name, "x"]) == EXIT_UNKNOWN_ITEM
         capsys.readouterr()
+
+
+# ── the version is declared once, where the release tooling looks ─────────────
+def test_the_version_comes_from_pyproject(capsys) -> None:
+    """`stt --version` must agree with the only place the number is written down."""
+    import tomllib
+
+    root = Path(__file__).resolve().parent.parent
+    with (root / "pyproject.toml").open("rb") as handle:
+        declared = tomllib.load(handle)["project"]["version"]
+
+    main(["--version"])
+    assert capsys.readouterr().out.strip() == f"stt {declared}"
+
+
+def test_the_version_is_written_down_exactly_once() -> None:
+    """No second copy anywhere in the package, because two copies drift.
+
+    The number used to live in `stt_cli/__init__.py` with pyproject pointing back at it.
+    Moving it into pyproject only helps if nothing quietly keeps the old literal around.
+    """
+    package = Path(__file__).resolve().parent.parent / "stt_cli"
+    literals = [
+        path
+        for path in package.rglob("*.py")
+        if re.search(r'^__version__\s*=\s*["\']', path.read_text(), re.MULTILINE)
+    ]
+    assert literals == [], f"a second version literal lives in {literals}"
+
+
+def test_importing_the_dispatcher_does_not_read_the_version() -> None:
+    """Resolving the version opens and parses a file; only `stt --version` should pay.
+
+    Asked in a fresh interpreter, because the obvious version of this test cannot work: by
+    the time a test can patch anything, the test module has already imported the dispatcher,
+    so a top-level `from . import __version__` has long since been resolved and a monkeypatch
+    proves nothing. That first attempt passed against the very change it was meant to catch.
+
+    `tomllib` is the tell. Nothing else in an import-clean startup pulls it, so its presence
+    means the version was resolved during import rather than on demand.
+    """
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    asked = subprocess.run(
+        [sys.executable, "-c", "import sys, stt_cli.cli; print('tomllib' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        check=True,
+    )
+    assert asked.stdout.strip() == "False", "importing the dispatcher read pyproject.toml"
+
+
+def test_an_unreadable_pyproject_falls_through_rather_than_raising(tmp_path) -> None:
+    """A malformed or absent file is a reason to ask the metadata, not to crash."""
+    import stt_cli
+
+    assert stt_cli._version_in(tmp_path / "absent.toml") is None
+
+    broken = tmp_path / "pyproject.toml"
+    broken.write_text("this is not [ valid toml")
+    assert stt_cli._version_in(broken) is None
+
+    wrong_shape = tmp_path / "other.toml"
+    wrong_shape.write_text("[project]\nname = 'x'\n")
+    assert stt_cli._version_in(wrong_shape) is None
+
+    # tomllib decodes the bytes itself, so a file that is not valid UTF-8 fails before any
+    # TOML parsing does. Catching only TOMLDecodeError let this one through and `stt
+    # --version` raised where it had promised to fall back.
+    not_utf8 = tmp_path / "bytes.toml"
+    not_utf8.write_bytes(b"[project]\nversion = '\xff'\n")
+    assert stt_cli._version_in(not_utf8) is None
+
+
+def test_somebody_elses_project_file_is_not_our_version(tmp_path) -> None:
+    """`stt_cli/` does not always sit in a directory of ours.
+
+    `pip install --target ./app` drops the package beside ./app/pyproject.toml. Trusting any
+    neighbouring project file made `stt --version` report the host application's version —
+    the same mistake `uv run` makes when it adopts whatever directory you were standing in.
+    """
+    import stt_cli
+
+    theirs = tmp_path / "pyproject.toml"
+    theirs.write_text('[project]\nname = "some-app"\nversion = "9.9.9"\n')
+    assert stt_cli._version_in(theirs) is None
+
+    ours = tmp_path / "ours.toml"
+    ours.write_text(f'[project]\nname = "{stt_cli.DISTRIBUTION}"\nversion = "1.2.3"\n')
+    assert stt_cli._version_in(ours) == "1.2.3"
+
+
+def test_the_installed_metadata_answers_a_copy_with_no_source_tree(monkeypatch) -> None:
+    """The branch every released wheel takes, and the only one never exercised by a checkout.
+
+    A regression here — a mistyped distribution name, say — is invisible while developing,
+    because a source tree answers first. It would surface as `stt 0+unknown` for everyone who
+    installed stt properly, and for nobody who works on it.
+    """
+    from importlib import metadata
+
+    import stt_cli
+
+    try:
+        # A real distribution under this name, so the lookup cannot silently give up. Skipped
+        # rather than failed on a bare clone: every other test here needs only an importable
+        # package, and this one must not quietly raise that bar for the whole suite.
+        installed = metadata.version(stt_cli.DISTRIBUTION)
+    except metadata.PackageNotFoundError:
+        pytest.skip(f"{stt_cli.DISTRIBUTION} is not installed in this environment")
+    assert installed
+
+    monkeypatch.setattr(stt_cli, "_version_in", lambda _: None)  # nothing beside us
+    stt_cli._declared_version.cache_clear()
+    try:
+        assert stt_cli.__version__ == installed
+        assert stt_cli.__version__ != stt_cli._UNKNOWN
+    finally:
+        stt_cli._declared_version.cache_clear()
+
+
+def test_the_version_is_resolved_once_and_kept(monkeypatch) -> None:
+    """The docstring promises "first use", so a long-running process must not re-read it."""
+    import stt_cli
+
+    assert hasattr(stt_cli._declared_version, "cache_clear"), "the resolver is not cached"
+    stt_cli._declared_version.cache_clear()
+    reads = []
+
+    def count(path):
+        reads.append(path)
+        return "4.5.6"
+
+    monkeypatch.setattr(stt_cli, "_version_in", count)
+    try:
+        assert stt_cli.__version__ == "4.5.6"
+        assert stt_cli.__version__ == "4.5.6"
+        assert len(reads) == 1, "the file was opened again for the second read"
+    finally:
+        stt_cli._declared_version.cache_clear()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stt-cli"
-dynamic = ["version"]
+version = "0.3.3"
 description = "Speech-to-text for any audio/video file on macOS: VAD-gated transcription, hallucination and loop scrubbing, decoding variants with confidence, optional LLM correction and speaker diarization, all cached in a local content-addressed archive."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,9 +37,6 @@ Issues = "https://github.com/alex-mextner/stt-cli/issues"
 
 [tool.setuptools.packages.find]
 include = ["stt_cli*"]
-
-[tool.setuptools.dynamic]
-version = { attr = "stt_cli.__version__" }
 
 [tool.ruff]
 line-length = 100

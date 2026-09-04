@@ -25,7 +25,6 @@ import pkgutil
 import sys
 from collections.abc import Callable
 
-from . import __version__
 from ._errors import EXIT_OK, guard, unknown_item
 
 _RunFn = Callable[[list[str]], int]
@@ -86,6 +85,10 @@ def _dispatch(args: list[str]) -> int:
         print(_usage(catalog))
         return EXIT_OK
     if head in {"-V", "--version", "version"}:
+        # Imported here, not at the top: resolving it reads a file, and no other command
+        # wants that cost. See the note in `stt_cli/__init__`.
+        from . import __version__
+
         print(f"stt {__version__}")
         return EXIT_OK
 
