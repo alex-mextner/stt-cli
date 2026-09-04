@@ -8,6 +8,7 @@ before it starts. See :mod:`stt_cli.diarize` for why it is not a dependency.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import subprocess
 import sys
 
@@ -36,9 +37,9 @@ def _status() -> int:
     """Both halves of "can I diarize right now": the wheels, and the credential."""
     from .. import auth
 
-    installed = diarize_mod.is_installed()
-    print(f"pyannote.audio: {'installed' if installed else 'not installed'}")
-    if not installed:
+    ready = asyncio.run(diarize_mod.ready())
+    print(f"pyannote.audio: {'ready' if ready else 'not ready'}")
+    if not ready:
         print(f"  fix: {diarize_mod.INSTALL_HINT}")
         return EXIT_MISSING_DEP
     signed_in = auth.status("diarization", "hf")
@@ -55,13 +56,22 @@ def _status() -> int:
 
 
 def _install(*, assume_yes: bool) -> int:
-    if diarize_mod.is_installed():
-        print("already installed")
+    if asyncio.run(diarize_mod.ready()):
+        print("already available")
         return _status()
 
     command = diarize_mod.install_command()
+    if command is None:
+        print("cannot prepare speaker diarization", file=sys.stderr)
+        print(f"  why: {diarize_mod.NO_ROUTE}", file=sys.stderr)
+        return EXIT_MISSING_DEP
     gib = int(diarize_mod.INSTALL_SIZE_GIB * 1024**3)
-    print(f"about to install speaker diarization (~{diarize_mod.INSTALL_SIZE_GIB} GiB):")
+    # "Fetch", not "install": nothing is written into any interpreter the user owns. uv
+    # resolves the wheels into an environment of its own and caches them, so this warms that
+    # cache once, visibly, instead of doing it inside somebody's first transcription.
+    print(
+        f"about to fetch speaker diarization (~{diarize_mod.INSTALL_SIZE_GIB} GiB, cached by uv):"
+    )
     print(f"  {' '.join(command)}")
     resources.require_space(
         gib, path=__import__("pathlib").Path.home(), what="the diarization extra"
@@ -74,9 +84,9 @@ def _install(*, assume_yes: bool) -> int:
 
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
-        print("install failed — see the output above", file=sys.stderr)
+        print("could not fetch it — see the output above", file=sys.stderr)
         return EXIT_MISSING_DEP
-    print("\ninstalled. One step left: the models are gated, so stt needs a token.")
+    print("\nfetched. One step left: the models are gated, so stt needs a token.")
     return _login_now()
 
 

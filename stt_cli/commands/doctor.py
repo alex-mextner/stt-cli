@@ -87,12 +87,12 @@ def _optional_section() -> None:
     if not tools:
         print(f"      fix: install one of {', '.join(llm.ORDER)} to enable --fix and --summary")
 
+    import asyncio
+
     from .. import diarize
 
-    installed = diarize.is_installed()
-    print(
-        f"  {_mark(installed)} speaker diarization: {'installed' if installed else 'not installed'}"
-    )
+    installed = asyncio.run(diarize.ready())
+    print(f"  {_mark(installed)} speaker diarization: {'ready' if installed else 'not ready'}")
     if not installed:
         print(f"      fix: {diarize.INSTALL_HINT}")
     _dictation_line()
