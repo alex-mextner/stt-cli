@@ -61,6 +61,7 @@ python_version = "3.11"
 strict = true
 warn_unreachable = true
 # Optional engines are imported lazily and are not installed in the type-check env.
+# `_colorize` is CPython's own, present from 3.13 on but absent from the 3.11 typeshed.
 [[tool.mypy.overrides]]
-module = ["mlx_whisper.*", "pyannote.*", "torch.*"]
+module = ["mlx_whisper.*", "pyannote.*", "torch.*", "_colorize"]
 ignore_missing_imports = true

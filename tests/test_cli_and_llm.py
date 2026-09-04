@@ -7,11 +7,14 @@ a failed pass, never an exception.
 
 from __future__ import annotations
 
+import os
+import sys
 from datetime import UTC, datetime
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from stt_cli import llm
+from stt_cli import llm, palette
 from stt_cli._errors import EXIT_OK, UnknownItemError, UsageError
 from stt_cli.cli import _looks_like_a_command, main
 from stt_cli.models import MediaInfo
@@ -205,3 +208,77 @@ def test_config_offers_exactly_the_settings_it_will_accept(capsys) -> None:
         assert main(["config", "get", name]) == EXIT_UNKNOWN_ITEM
         assert main(["config", "set", name, "x"]) == EXIT_UNKNOWN_ITEM
         capsys.readouterr()
+
+
+# ── the top-level help wears argparse's colours ───────────────────────────────
+_LOUD = palette.Palette(heading="<H>", prog="<P>", action="<A>", reset="<->")
+
+
+def _plain(text: str) -> str:
+    for mark in ("<H>", "<P>", "<A>", "<->"):
+        text = text.replace(mark, "")
+    return text
+
+
+def test_the_top_level_help_is_plain_when_argparse_would_be(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(palette, "for_help", lambda: palette.Palette())
+    main(["--help"])
+    written = capsys.readouterr().out
+    assert "\x1b" not in written
+    assert "  doctor         check ffmpeg" in written
+
+
+def test_colour_never_moves_a_column(monkeypatch, capsys) -> None:
+    """Padding is measured on the text, so a coloured help lines up like a plain one."""
+    monkeypatch.setattr(palette, "for_help", lambda: palette.Palette())
+    main(["--help"])
+    plain = capsys.readouterr().out
+
+    monkeypatch.setattr(palette, "for_help", lambda: _LOUD)
+    main(["--help"])
+    coloured = capsys.readouterr().out
+
+    assert "<H>usage:<->" in coloured
+    assert "<P>stt<-> <file>" in coloured
+    assert _plain(coloured) == plain
+
+
+def test_no_palette_when_argparse_does_not_colour(monkeypatch) -> None:
+    monkeypatch.setattr(palette, "_argparse_colours_at_all", lambda: False)
+    assert palette.for_help() == palette.Palette()
+
+
+_THEME = SimpleNamespace(
+    heading="\x1b[1;34m", prog="\x1b[1;35m", action="\x1b[1;32m", reset="\x1b[0m"
+)
+
+
+def _pretend_argparse_colours(monkeypatch) -> None:
+    """Stand in for CPython's private colour module, so these branches run on any Python.
+
+    Without this the tests below are vacuous everywhere but 3.14: ``for_help`` gives up at
+    the first gate and never reaches the part we wrote. The stand-in reads ``NO_COLOR`` the
+    way CPython's own ``can_colorize`` does, which is the contract we are relying on.
+    """
+    colorize = ModuleType("_colorize")
+    colorize.can_colorize = lambda: not os.environ.get("NO_COLOR")  # type: ignore[attr-defined]
+    colorize.get_theme = lambda **_: SimpleNamespace(argparse=_THEME)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "_colorize", colorize)
+    monkeypatch.setattr(palette, "_argparse_colours_at_all", lambda: True)
+
+
+def test_the_palette_is_the_one_argparse_would_use(monkeypatch) -> None:
+    _pretend_argparse_colours(monkeypatch)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert palette.for_help() == palette.Palette(
+        heading=_THEME.heading,
+        prog=_THEME.prog,
+        action=_THEME.action,
+        reset=_THEME.reset,
+    )
+
+
+def test_no_palette_when_the_terminal_asks_for_none(monkeypatch) -> None:
+    _pretend_argparse_colours(monkeypatch)
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert palette.for_help() == palette.Palette()

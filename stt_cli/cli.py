@@ -25,7 +25,7 @@ import pkgutil
 import sys
 from collections.abc import Callable
 
-from . import __version__
+from . import __version__, palette
 from ._errors import EXIT_OK, guard, unknown_item
 
 _RunFn = Callable[[list[str]], int]
@@ -47,28 +47,76 @@ def _discover() -> dict[str, tuple[str, str]]:
     return dict(sorted(found.items()))
 
 
+_HEADLINE = "stt — speech to text for any audio or video file"
+_CLOSING = "run `stt <command> --help` for a command's own options."
+
+# Where a summary starts, counted from the two-space indent. Two columns, because a
+# command name is a word and an example is most of a command line.
+_COMMAND_COLUMN = 15
+_EXAMPLE_COLUMN = 31
+
+_INVOCATIONS = (
+    ("stt <file>... [options]", "transcribe (the common case)"),
+    ("stt <command> [args]", ""),
+)
+_GETTING_STARTED = (
+    ("stt setup", "detect what is installed and choose an engine"),
+    ("stt doctor", "check the toolchain"),
+    ("stt rec.m4a -f txt,srt", "transcribe to text and subtitles"),
+    ("stt rec.m4a --summary --fix", "correct with an LLM and summarize"),
+)
+
+
 def _usage(catalog: dict[str, tuple[str, str]]) -> str:
-    lines = [
-        "stt — speech to text for any audio or video file",
-        "",
-        "usage:",
-        "  stt <file>... [options]        transcribe (the common case)",
-        "  stt <command> [args]",
-        "",
-        "commands:",
+    """The top-level help, painted the way argparse paints every subcommand's."""
+    paint = palette.for_help()
+    return "\n".join(
+        [
+            _HEADLINE,
+            "",
+            _heading("usage:", paint),
+            *_example_rows(_INVOCATIONS, paint),
+            "",
+            _heading("commands:", paint),
+            *_command_rows(catalog, paint),
+            "",
+            _heading("getting started:", paint),
+            *_example_rows(_GETTING_STARTED, paint),
+            "",
+            _CLOSING,
+        ]
+    )
+
+
+def _heading(text: str, paint: palette.Palette) -> str:
+    return f"{paint.heading}{text}{paint.reset}"
+
+
+def _command_rows(catalog: dict[str, tuple[str, str]], paint: palette.Palette) -> list[str]:
+    """One row per command, its name in the colour argparse gives a positional."""
+    return [
+        _row(f"{paint.action}{name}{paint.reset}", name, summary, _COMMAND_COLUMN)
+        for name, (_, summary) in catalog.items()
     ]
-    lines += [f"  {name:<14} {summary}" for name, (_, summary) in catalog.items()]
-    lines += [
-        "",
-        "getting started:",
-        "  stt setup                      detect what is installed and choose an engine",
-        "  stt doctor                     check the toolchain",
-        "  stt rec.m4a -f txt,srt         transcribe to text and subtitles",
-        "  stt rec.m4a --summary --fix    correct with an LLM and summarize",
-        "",
-        "run `stt <command> --help` for a command's own options.",
-    ]
-    return "\n".join(lines)
+
+
+def _example_rows(examples: tuple[tuple[str, str], ...], paint: palette.Palette) -> list[str]:
+    """One row per example, with only the program name coloured — argparse does the same."""
+    rows = []
+    for invocation, summary in examples:
+        prog, _, rest = invocation.partition(" ")
+        shown = f"{paint.prog}{prog}{paint.reset}"
+        if rest:
+            shown = f"{shown} {rest}"
+        rows.append(_row(shown, invocation, summary, _EXAMPLE_COLUMN))
+    return rows
+
+
+def _row(shown: str, plain: str, summary: str, column: int) -> str:
+    """Indent *shown*, then pad to *column* — measured on *plain*, since colour is not wide."""
+    if not summary:
+        return f"  {shown}"
+    return f"  {shown}{' ' * max(1, column - len(plain))}{summary}"
 
 
 def main(argv: list[str] | None = None) -> int:
