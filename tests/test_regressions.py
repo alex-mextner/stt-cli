@@ -348,7 +348,9 @@ async def test_the_hugging_face_token_never_reaches_a_command_line(monkeypatch) 
         seen["env"] = kwargs.get("env")
         return proc.Result(code=0, stdout='{"turns": []}', stderr="", argv=list(argv))
 
-    monkeypatch.setattr(diarize, "runner", lambda **_: ["/usr/bin/python3"])
+    monkeypatch.setattr(
+        diarize, "runner", lambda **_: diarize.Route("direct", ["/usr/bin/python3"])
+    )
     monkeypatch.setattr(diarize, "ready", _answers(True))
     monkeypatch.setattr(diarize, "require_token", lambda: "hf_secret_value")
     monkeypatch.setattr(proc, "run", remember)
@@ -373,7 +375,9 @@ async def test_asking_whether_diarization_is_ready_never_downloads_anything(monk
         return proc.Result(code=0, stdout='{"ready": true}', stderr="", argv=list(argv))
 
     monkeypatch.setattr(
-        diarize, "runner", lambda: ["/opt/uv", "run", "--quiet", "--with", "x", "python"]
+        diarize,
+        "runner",
+        lambda: diarize.Route("uv", ["/opt/uv", "run", "--quiet", "--with", "x", "python"]),
     )
     monkeypatch.setattr(proc, "run", remember)
 
@@ -390,7 +394,9 @@ async def test_a_status_check_that_fails_reports_rather_than_raises(monkeypatch)
     async def time_out(argv, **kwargs):
         raise TimeoutError("the probe never came back")
 
-    monkeypatch.setattr(diarize, "runner", lambda: ["/opt/uv", "run", "--quiet", "python"])
+    monkeypatch.setattr(
+        diarize, "runner", lambda: diarize.Route("uv", ["/opt/uv", "run", "--quiet", "python"])
+    )
     monkeypatch.setattr(proc, "run", time_out)
 
     assert await diarize.ready() is False
@@ -442,16 +448,25 @@ async def test_diarization_that_runs_too_long_says_so_rather_than_crashing(
 ) -> None:
     """The timeout was introduced by the move to a worker, and was the one failure in that
     function not turned into a sentence — so the longest-running command in the tool ended an
-    hour of somebody's time with a stack trace."""
+    hour of somebody's time with a stack trace.
+
+    The first version of this test faked a contract `proc.run` does not have: it raised a raw
+    `TimeoutError`, which `proc.run` catches itself and never lets out. So the handler under
+    test was unreachable in production while the test went green — the exact shape of a guard
+    that cannot fail. `proc.run` now marks its timeouts with a type, and this raises that type;
+    that `proc.run` really raises it is pinned separately, against a real process.
+    """
     from stt_cli import diarize, proc
-    from stt_cli._errors import EngineError
+    from stt_cli._errors import EngineError, ProcessTimeout
 
     async def never_finishes(argv, **kwargs):
-        raise TimeoutError("still going")
+        raise ProcessTimeout(what="uv timed out after 30 min", why="no result in time")
 
     audio = tmp_path / "long.wav"
     audio.write_bytes(b"\x00" * 32_000)
-    monkeypatch.setattr(diarize, "runner", lambda **_: ["/usr/bin/python3"])
+    monkeypatch.setattr(
+        diarize, "runner", lambda **_: diarize.Route("direct", ["/usr/bin/python3"])
+    )
     monkeypatch.setattr(diarize, "ready", _answers(True))
     monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
     monkeypatch.setattr(proc, "run", never_finishes)
@@ -460,6 +475,22 @@ async def test_diarization_that_runs_too_long_says_so_rather_than_crashing(
         await diarize.diarize(audio)
     assert "did not finish" in refused.value.what
     assert "minutes" in refused.value.why, "and it says how long it waited"
+
+
+async def test_a_process_that_outruns_its_budget_says_so_by_type() -> None:
+    """The other half of the timeout contract, against a real process rather than a stub.
+
+    `diarize` catches `ProcessTimeout` to replace a decode-flavoured message with one that
+    makes sense for diarization. That only works if `proc.run` genuinely raises that type, so
+    this runs something slow with an impatient budget and checks what comes out. Without it,
+    the two halves could drift apart and both tests would still pass.
+    """
+    from stt_cli import proc
+    from stt_cli._errors import ProcessTimeout
+
+    with pytest.raises(ProcessTimeout) as ran_out:
+        await proc.run(["/bin/sleep", "5"], timeout=0.2)
+    assert "timed out" in ran_out.value.what
 
 
 def test_the_diarization_budget_follows_the_length_of_the_recording(tmp_path) -> None:
@@ -502,7 +533,9 @@ async def test_diarizing_never_downloads_two_gigabytes_on_its_own(monkeypatch, t
         ran.append(list(argv))
         raise AssertionError("nothing may be launched when the wheels are not ready")
 
-    monkeypatch.setattr(diarize, "runner", lambda **_: ["/opt/uv", "run", "--quiet", "python"])
+    monkeypatch.setattr(
+        diarize, "runner", lambda **_: diarize.Route("uv", ["/opt/uv", "run", "--quiet", "python"])
+    )
     monkeypatch.setattr(diarize, "ready", _answers(False))
     monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
     monkeypatch.setattr(proc_mod, "run", refuse)
@@ -521,9 +554,11 @@ def test_uv_is_never_allowed_to_adopt_the_directory_the_user_stood_in(monkeypatc
     from stt_cli import diarize, proc
 
     monkeypatch.setattr(proc, "which", lambda name: "/opt/uv" if name == "uv" else None)
-    argv = diarize.runner(force_uv=True)
+    route = diarize.runner(force_uv=True)
 
-    assert argv is not None
+    assert route is not None
+    name, argv = route
+    assert name == "uv"
     assert "--no-project" in argv, "stt is not a member of anybody's workspace"
     assert argv.index("--no-project") < argv.index("--with"), "before the wheels it asks for"
 
@@ -533,8 +568,6 @@ def test_a_broken_local_pyannote_does_not_capture_the_install(monkeypatch) -> No
     leaving an incompatible torch wheel is the ordinary way. `stt diarize install` would then
     have re-run the same failing import forever instead of preparing the environment that
     works."""
-    import importlib.util
-
     from stt_cli import diarize, proc
 
     monkeypatch.setattr(proc, "which", lambda name: "/opt/uv" if name == "uv" else None)
@@ -544,6 +577,54 @@ def test_a_broken_local_pyannote_does_not_capture_the_install(monkeypatch) -> No
 
     assert command is not None
     assert command[0] == "/opt/uv", "the install prepares uv's environment, not the broken one"
+
+
+def test_without_uv_a_broken_pyannote_gets_the_truth_instead_of_a_download(monkeypatch) -> None:
+    """The install must not fall back onto the interpreter that is the reason it was called.
+
+    `stt diarize install` runs only after `ready()` said no. If pyannote is nevertheless
+    importable-looking here, it is broken — and the earlier fallback handed that same broken
+    interpreter back as the install command. The user was then told two and a half gigabytes
+    were about to be fetched, made to have that much disk free, asked to confirm, and finally
+    shown "could not fetch it" from an import that downloaded nothing. The one thing that
+    would have helped — install uv — was never printed, because that branch was unreachable.
+    """
+    from stt_cli import diarize, proc
+
+    # pyannote looks present, and there is no uv anywhere.
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(proc, "which", lambda name: None)
+
+    assert diarize.install_command() is None, "no route is the honest answer here"
+
+
+async def test_an_unrecognisable_answer_is_not_read_as_no_speakers(monkeypatch, tmp_path) -> None:
+    """A worker answer with neither turns nor an error used to mean an empty list of turns.
+
+    The run then finished with "diarization found 0 speaker(s)" — a warning, not a failure —
+    so somebody who asked for `--diarize` and waited for it got a transcript with nobody in it
+    and no reason given. `_the_object_among` takes the LAST object printed, so anything torch
+    prints while shutting down could become the answer; an answer now has to look like one.
+    """
+    from stt_cli import diarize, proc
+    from stt_cli._errors import EngineError
+
+    async def answer_with_something_else(argv, **kwargs):
+        payload = '{"ready": true}' if "--probe" in argv else '{"cuda_visible_devices": 0}'
+        return proc.Result(code=0, stdout=payload, stderr="", argv=list(argv))
+
+    monkeypatch.setattr(
+        diarize, "runner", lambda **_: diarize.Route("direct", ["/usr/bin/python3"])
+    )
+    monkeypatch.setattr(diarize, "ready", _answers(True))
+    monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
+    monkeypatch.setattr(proc, "run", answer_with_something_else)
+
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"\x00" * 32_000)
+    with pytest.raises(EngineError) as refused:
+        await diarize.diarize(audio)
+    assert "neither speakers nor a reason" in refused.value.what
 
 
 async def test_a_local_pyannote_is_still_enough_on_its_own(monkeypatch, tmp_path) -> None:
@@ -558,9 +639,11 @@ async def test_a_local_pyannote_is_still_enough_on_its_own(monkeypatch, tmp_path
     from stt_cli import diarize, proc
 
     launched: list[list[str]] = []
+    budgets: list[float] = []
 
     async def answer(argv, **kwargs):
         launched.append(list(argv))
+        budgets.append(kwargs["timeout"])
         payload = '{"ready": true}' if "--probe" in argv else '{"turns": []}'
         return proc.Result(code=0, stdout=payload, stderr="", argv=list(argv))
 
@@ -573,6 +656,16 @@ async def test_a_local_pyannote_is_still_enough_on_its_own(monkeypatch, tmp_path
     audio = tmp_path / "meeting.wav"
     audio.write_bytes(b"\x00" * 32_000)
     assert await diarize.diarize(audio) == []
+
+    # And the probe was given the WORK's budget, not the status line's. Importing torch off a
+    # cold disk can outrun 300 seconds; giving up there would refuse a machine that was about
+    # to succeed. Nothing else pins this — every other test replaces `ready` with a constant
+    # that swallows the argument, so reverting the work path to a bare `ready()` would leave
+    # the whole suite green.
+    from stt_cli.diarize import MINIMUM_TIMEOUT, PROBE_TIMEOUT
+
+    assert budgets[0] == MINIMUM_TIMEOUT, "the probe waits as long as the work would"
+    assert budgets[0] != PROBE_TIMEOUT, "and not the budget meant for a status line"
 
     assert len(launched) == 2, "it probed, then it worked"
     assert launched[0][0] == sys.executable, "asking the interpreter that has pyannote"

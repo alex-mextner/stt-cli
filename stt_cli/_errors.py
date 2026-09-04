@@ -90,6 +90,15 @@ class EngineError(SttError):
     exit_code = EXIT_ENGINE
 
 
+class ProcessTimeout(EngineError):
+    """A child process outran its budget, as opposed to failing on its own terms.
+
+    A plain :class:`EngineError` cannot be told apart from the ordinary failures a backend
+    reports, so a caller who wants to say something better about "it ran too long" — and
+    diarization does — had no way to catch only that.
+    """
+
+
 class MissingDependencyError(SttError):
     exit_code = EXIT_MISSING_DEP
 

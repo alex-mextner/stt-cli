@@ -32,7 +32,10 @@ def main(argv: list[str]) -> int:
     # argv out of `ps`, and diarization can run for an hour, so a token passed that way is
     # readable for an hour. It arrives in the environment instead, which is the same channel
     # huggingface_hub reads on its own.
-    parser.add_argument("--pipeline", default="pyannote/speaker-diarization-3.1")
+    # No default. The caller always passes the pipeline it decided on, and a default here
+    # would be a second copy of that model id, free to disagree with the first one the next
+    # time the pipeline is bumped.
+    parser.add_argument("--pipeline")
     # Answer whether this environment can diarize, without downloading a model or reading
     # audio. `stt diarize status` asks the environment that will do the work rather than
     # importing into the CLI's own interpreter, which may not be the one that has it.
@@ -42,8 +45,8 @@ def main(argv: list[str]) -> int:
     if args.probe:
         return _say({"ready": _importable()})
     token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
-    if not args.audio or not token:
-        return _say({"error": "--audio and a token in the environment are required"})
+    if not args.audio or not args.pipeline or not token:
+        return _say({"error": "--audio, --pipeline and a token in the environment are required"})
     try:
         return _say({"turns": _run(args, token)})
     except Exception as failure:  # the caller renders this; a traceback here helps nobody

@@ -45,7 +45,7 @@ def test_every_command_module_exposes_the_contract() -> None:
         ["diarize", "status"],
     ],
 )
-def test_read_only_commands_run(argv: list[str]) -> None:
+def test_read_only_commands_run(argv: list[str], monkeypatch) -> None:
     """A missing optional dependency is a reported exit code, never a traceback.
 
     Three codes, not two, and which one comes back is a property of the MACHINE rather than
@@ -53,6 +53,17 @@ def test_read_only_commands_run(argv: list[str]) -> None:
     "ready, but no token" where they are cached, and both are correct reports of a real
     state. The claim being made here is that none of them is an exception.
     """
+    # The readiness probe is answered here rather than run. It launches a real `uv run` and,
+    # with a warm diarization cache, imports torch — tens of seconds, and a different answer
+    # on every machine. This file's contract is that a command needs no model, no GPU and no
+    # network, and a smoke test that spawns a subprocess is not keeping it.
+    from stt_cli import diarize as diarize_mod
+
+    async def not_ready() -> bool:
+        return False
+
+    monkeypatch.setattr(diarize_mod, "ready", lambda **_: not_ready())
+
     # The third code is allowed for diarization ALONE. Widening it for every command would
     # have made this quietly accept "you are not signed in" from `stt config list`, which
     # would be a defect rather than a state.

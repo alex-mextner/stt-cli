@@ -19,26 +19,38 @@ HOW SPEAKERS ARE ATTACHED
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import proc
 from ._errors import (
     EngineError,
     MissingDependencyError,
     PermissionDeniedError,
+    ProcessTimeout,
 )
 from .models import Segment
+
+
+class Route(NamedTuple):
+    """How the worker gets run: which way, and the argv that does it.
+
+    A bare tuple would have callers reading `route[1]`, which says nothing about what the
+    second element is — the same shapelessness `_offline` was rewritten to stop relying on.
+    """
+
+    name: str
+    argv: list[str]
+
 
 # The pretrained pipeline. Gated on Hugging Face: the user must accept its terms once and
 # supply a token, which is why the error path below is as detailed as it is.
 PIPELINE = "pyannote/speaker-diarization-3.1"
 INSTALL_SIZE_GIB = 2.5
-# Diarization of a long recording is genuinely slow, and the first run also downloads the
-# model. Generous, because the cost of being wrong here is a failure on a file that would
-# have finished.
 # How long diarization may take, per second of audio. Diarization runs faster than real time
 # on this hardware, so twenty times is not a budget anybody meets by working slowly — it is
 # the point past which something has gone wrong. A FIXED hour was the first attempt and was
@@ -49,9 +61,10 @@ TIMEOUT_PER_SECOND = 20.0
 # ...and a floor, because the first run also downloads the model.
 MINIMUM_TIMEOUT = 1800.0
 # Importing torch off a cold disk is not fast, and a probe that gives up too early reports
-# "not ready" on a machine that can diarize perfectly well — a false negative in the one
-# command people run to find out where they stand. Generous, because nothing waits on it but
-# a status line.
+# "not ready" on a machine that can diarize perfectly well. This is the budget for a STATUS
+# question only — `stt doctor`, `stt diarize status` — where the cost of waiting is one
+# slow line. The work path asks the same question with its own, much larger budget, because
+# there a false negative refuses to diarize a machine that could have.
 PROBE_TIMEOUT = 300.0
 
 NO_ROUTE = (
@@ -78,7 +91,7 @@ class Turn:
 WHEELS = ("pyannote.audio", "torch")
 
 
-def runner(*, force_uv: bool = False) -> list[str] | None:
+def runner(*, force_uv: bool = False) -> Route | None:
     """The interpreter that will run the worker: ours if it already has pyannote, else uv's.
 
     NOTHING IS INSTALLED ANYWHERE. This used to `pip install` into `sys.executable`, which on
@@ -89,15 +102,16 @@ def runner(*, force_uv: bool = False) -> list[str] | None:
     caches it, so the cost is a one-time resolve rather than a permanent dependency for every
     user — which is exactly what `backends/mlx.py` already does for mlx-whisper.
 
+    Returns the route's NAME alongside its argv — "direct" or "uv". Callers that must treat
+    the two differently (`_offline`) then ask which route this is, rather than inspecting the
+    argv and guessing; `backends/mlx.py` settled on the same shape for the same reason.
+
     None means neither route exists: no pyannote here, and no uv to supply it.
     """
-    import importlib.util
-    import sys
-
     if not force_uv:
         try:
             if importlib.util.find_spec("pyannote.audio") is not None:
-                return [sys.executable]
+                return Route("direct", [sys.executable])
         except (ImportError, ModuleNotFoundError, ValueError):
             pass  # the parent package is absent, which is the ordinary case
     uv = proc.which("uv")
@@ -112,7 +126,7 @@ def runner(*, force_uv: bool = False) -> list[str] | None:
     # resolving its dependencies, which have nothing to do with diarization and everything to
     # do with where the user happened to be standing. stt is not a member of anybody's
     # workspace; it wants an environment holding two wheels and nothing else.
-    return [uv, "run", "--quiet", "--no-project", *supply, "python"]
+    return Route("uv", [uv, "run", "--quiet", "--no-project", *supply, "python"])
 
 
 def install_command() -> list[str] | None:
@@ -122,15 +136,16 @@ def install_command() -> list[str] | None:
     visibly, when the user asked for it — rather than in the middle of their first
     transcription. There is nothing to uninstall afterwards but a uv cache entry.
     """
-    # The uv route, always, when uv is there. `ready()` has already said no by the time this
-    # is called, and a "no" from a direct interpreter that HAS pyannote means that pyannote
-    # is broken — a Python upgrade leaving an incompatible torch wheel behind is the ordinary
-    # way. Re-running the same failing import would have been the whole of `stt diarize
-    # install` in that case; preparing the uv environment is the thing that helps.
-    argv = runner(force_uv=True) or runner()
-    if argv is None:
+    # The uv route, and ONLY the uv route. `ready()` has already said no by the time this is
+    # called, so a direct interpreter that still HAS pyannote is one whose pyannote is broken
+    # — a Python upgrade leaving an incompatible torch wheel behind is the ordinary way.
+    # Falling back to it would re-run the very import that just failed, after promising two
+    # and a half gigabytes, demanding the disk space for them and asking the user to confirm.
+    # Without uv there is no route, and saying so is the only answer that helps.
+    route = runner(force_uv=True)
+    if route is None:
         return None
-    return [*argv, "-c", "import pyannote.audio, torch"]
+    return [*route.argv, "-c", "import pyannote.audio, torch"]
 
 
 def require_token() -> str:
@@ -151,7 +166,7 @@ def require_token() -> str:
     )
 
 
-async def ready() -> bool:
+async def ready(*, timeout: float = PROBE_TIMEOUT) -> bool:
     """Can this machine diarize right now, WITHOUT fetching anything to find out?
 
     Two things this must not do, both of which it did in a first version.
@@ -168,14 +183,15 @@ async def ready() -> bool:
     failing is the honest "no".
 
     Never raises. This is a status, and a status that throws is not one.
+
+    The default *timeout* suits a status line. The work path passes its own, because there a
+    probe that gives up early does not print a wrong word — it refuses to diarize.
     """
-    argv = runner()
-    if argv is None:
+    route = runner()
+    if route is None:
         return False
     try:
-        answered = await _ask_the_worker(
-            [*_offline(argv), _worker(), "--probe"], timeout=PROBE_TIMEOUT
-        )
+        answered = await _ask_the_worker([*_offline(route), _worker(), "--probe"], timeout=timeout)
     except Exception:
         # Everything, not just `SttError`. The docstring above says this never raises, and
         # only the diagnosed errors were being caught — a `TimeoutError` from the probe, or
@@ -185,20 +201,32 @@ async def ready() -> bool:
     return bool(answered.get("ready"))
 
 
-def _offline(argv: list[str]) -> list[str]:
-    """The same runner, forbidden to reach the network. A no-op for a direct interpreter."""
-    if len(argv) > 1 and argv[1] == "run":
-        return [argv[0], "run", "--offline", *argv[2:]]
-    return argv
+def _offline(route: Route) -> list[str]:
+    """The same runner, forbidden to reach the network. A no-op for a direct interpreter.
+
+    Keyed on the route's name rather than on the shape of its argv. The argv test this
+    replaces ("is the second word `run`?") was a private agreement with one exact spelling of
+    the uv command: reorder it, or put an environment variable in front, and the guard would
+    have quietly stopped adding `--offline` — and `stt doctor` would download two and a half
+    gigabytes again, which is the one thing this whole path exists to prevent.
+    """
+    if route.name != "uv":
+        return route.argv
+    # Inserted after the subcommand rather than over it. Writing `run` back in at index 1
+    # would have been a second, quieter assumption about the exact argv this builds — the
+    # kind the route name was introduced to retire.
+    argv = route.argv
+    return [*argv[:2], "--offline", *argv[2:]]
 
 
 async def diarize(wav: Path, *, speakers: int | None = None) -> list[Turn]:
     """Run the diarization pipeline over the normalized audio and return speaker turns."""
-    argv = runner()
-    if argv is None:
+    budget = _long_enough_for(wav)
+    route = runner()
+    if route is None:
         raise MissingDependencyError(
             what="speaker diarization is not available",
-            why="pyannote.audio is not importable here and uv is not installed to supply it",
+            why=NO_ROUTE,
             how=INSTALL_HINT,
         )
     # Asked before any work, and this is not belt-and-braces. The runner is an ONLINE
@@ -206,7 +234,11 @@ async def diarize(wav: Path, *, speakers: int | None = None) -> list[Turn]:
     # gigabytes — inside somebody's transcription, with both streams captured, so not even a
     # progress bar reaches them. The download belongs to `stt diarize install`, where it was
     # asked for and can be watched.
-    if not await ready():
+    #
+    # With THIS command's budget, not the status line's. The probe imports torch, which off a
+    # cold disk is slow enough to outrun a short limit — and here giving up early would refuse
+    # a machine that was about to succeed, rather than print one pessimistic line.
+    if not await ready(timeout=budget):
         raise MissingDependencyError(
             what="speaker diarization is not ready",
             why="the wheels are not in place, and fetching them is not this command's job",
@@ -215,18 +247,29 @@ async def diarize(wav: Path, *, speakers: int | None = None) -> list[Turn]:
     token = require_token()
     said = await _ask_the_worker(
         [
-            *argv, _worker(),
+            *route.argv, _worker(),
             "--audio", str(wav),
             "--pipeline", PIPELINE,
             *(["--speakers", str(speakers)] if speakers else []),
         ],
-        timeout=_long_enough_for(wav),
+        timeout=budget,
         # In the environment, never in argv. A command line is readable by every user on the
         # machine, and diarizing an hour of audio keeps the process alive for long enough to
         # be caught by anybody running `ps`. This is the variable huggingface_hub reads
         # anyway, so the worker does not have to be told twice.
         secret={"HUGGING_FACE_HUB_TOKEN": token},
     )  # fmt: skip
+    if "turns" not in said and "error" not in said:
+        # Without this, an unrecognised object read as zero turns and the run finished with a
+        # cheerful "found 0 speaker(s)" — the user asked for --diarize, waited for it, and got
+        # a transcript with nobody in it and nothing saying why. `_the_object_among` takes the
+        # LAST object on stdout, so anything torch prints on its way out could be read as the
+        # answer; an answer has to look like one.
+        raise EngineError(
+            what="speaker diarization returned neither speakers nor a reason",
+            why=f"the worker answered with an object that is not a result: {said!r:.200}",
+            how="run `stt diarize status` to see whether the environment is intact",
+        )
     if "error" in said:
         raise EngineError(
             what="speaker diarization failed",
@@ -261,10 +304,12 @@ async def _ask_the_worker(
     """Run the worker and read its one JSON object, or say why that did not happen."""
     try:
         result = await proc.run(argv, timeout=timeout, env=secret)
-    except TimeoutError as ran_out:
-        # Every other failure in here is turned into a sentence; this was the one path that
-        # escaped as a traceback, and it escaped from the longest-running command in the tool
-        # — an hour of somebody's time, ending in a stack trace.
+    except ProcessTimeout as ran_out:
+        # `proc.run` catches the raw `TimeoutError` itself and reports it in the vocabulary of
+        # a decode: "uv timed out", try a smaller model, split the input. Every word of that
+        # is wrong here — uv finished within the first second, the worker is what is slow,
+        # there is no smaller diarization model, and no flag raises this limit. So `proc.run`
+        # marks its timeouts with a type, and this is the caller that wanted to know.
         raise EngineError(
             what="speaker diarization did not finish",
             why=f"the worker was still running after {timeout / 60:.0f} minutes",

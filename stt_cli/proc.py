@@ -19,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from ._errors import EngineError, MissingDependencyError
+from ._errors import EngineError, MissingDependencyError, ProcessTimeout
 
 # Generous, but never absent: a wedged ffmpeg or engine must fail loudly rather than hold
 # the run open until someone notices tomorrow.
@@ -92,7 +92,7 @@ async def run(
         out, err = await asyncio.wait_for(proc.communicate(payload), timeout=timeout)
     except TimeoutError as exc:
         _terminate(proc)
-        raise EngineError(
+        raise ProcessTimeout(
             what=f"{Path(argv[0]).name} timed out after {timeout / 60:.0f} min",
             why="the process produced no result within the allowed time",
             how=(
