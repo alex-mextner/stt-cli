@@ -23,9 +23,11 @@ WHAT REPLACES THE UNDERLINE
 
 from __future__ import annotations
 
+import threading
 import unicodedata
-from dataclasses import dataclass
-from typing import Protocol
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 
 class Keyboard(Protocol):
@@ -101,6 +103,11 @@ _HANGUL_V = range(0x1160, 0x11A8)
 _HANGUL_T = range(0x11A8, 0x1200)
 
 
+# U+E0020..U+E007F: the tag characters, which spell out a subdivision flag's region code
+# after a black flag and are drawn and deleted as part of it.
+_TAGS = range(0xE0020, 0xE0080)
+
+
 def _joins_the_one_before(text: str, at: int) -> bool:
     """Does the code point at `at` continue the cluster that precedes it?
 
@@ -121,9 +128,20 @@ def _joins_the_one_before(text: str, at: int) -> bool:
         return True
     if here in _VARIATION_SELECTORS or here in _SKIN_TONES or here == _ZERO_WIDTH_JOINER:
         return True
+    # A tag character continues whatever it is tagging. The subdivision flags are spelled
+    # this way — England is a black flag followed by five tag letters and a terminator — and
+    # the rule below about "anything after a formatting character" does not reach the FIRST
+    # of them, because what precedes it is the flag itself. So the England flag counted as
+    # two characters, and a text field that deletes it with one press was sent two: the
+    # second came out of whatever the user had written in front of it.
+    if ord(here) in _TAGS:
+        return True
     # Anything after a formatting character — the zero-width joiner among them, and the
-    # prepending marks that several scripts put in front of a word.
-    if unicodedata.category(before) == "Cf":
+    # prepending marks that several scripts put in front of a word. Tag characters are
+    # excluded: they are formatting characters too, but a tag sequence ENDS at its
+    # terminator, so this rule would have glued whatever came next onto the flag. Two flags
+    # in a row counted as one character, and so did a flag followed by a letter.
+    if unicodedata.category(before) == "Cf" and ord(before) not in _TAGS:
         return True
     # A virama asks for the consonant after it: Devanagari, Bengali, Tamil and the rest write
     # a conjunct that way, and it is drawn and deleted as one thing.
@@ -217,6 +235,9 @@ class Typist:
     keys: Keyboard
     shown: str = ""
     abandoned: bool = False
+    # Held for the length of ONE keystroke, and by `disown` for the length of setting a flag.
+    # See `_still_ours` for what it closes and why it is safe to make the tap's thread wait.
+    _keyboard: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def begin(self) -> None:
         """A new sentence has started being spoken. Deliberately does NOT let go of the text.
@@ -245,7 +266,9 @@ class Typist:
         empty. What has already been typed stays on screen and is simply never touched again,
         which is the same answer `disown` gives everywhere else.
         """
-        if self._ownership_is_gone():
+        # An early exit, not a guarantee: `disown` can land on the next line just as easily.
+        # What makes each keystroke safe is `_still_ours`, which asks and posts as one step.
+        if self.abandoned:
             return False
         edit = plan(self.shown, text)
         if edit.empty:
@@ -256,32 +279,56 @@ class Typist:
         # had just typed at their new caret. Whatever has been removed by then is stt's own
         # text; stopping mid-way leaves the line short, which is the harmless half.
         for _ in range(edit.backspaces):
-            if self._ownership_is_gone():
+            if not self._still_ours(self.keys.press_backspace, 1):
                 return False
-            self.keys.press_backspace(1)
         # In small pieces, asking again between each, for the same reason as the backspaces
         # above. The replacement for a settled sentence can be a hundred characters, and the
         # keyboard posts them in bursts — a click landing after the first burst was answered
         # by posting the rest anyway, into the window the click had just focused.
         for piece in _in_pieces(edit.text):
-            if self._ownership_is_gone():
+            if not self._still_ours(self.keys.type_text, piece):
                 return False
-            self.keys.type_text(piece)
-        if self._ownership_is_gone():
-            return False
-        self.shown = text
-        return True
+        return self._claim(text)
 
-    def _ownership_is_gone(self) -> bool:
-        """`self.abandoned`, read through a call so that nothing assumes it cannot change.
+    def _claim(self, text: str) -> bool:
+        """Record what is now on screen, unless ownership was lost while it was going out.
 
-        A type checker looking at `if self.abandoned: ...` and then at the same expression
-        further down concludes the second one is dead code, which is true of a value only
-        this thread can write and false of this one: `disown` runs on the keyboard watcher's
-        thread and can set it between any two lines here. The call is the honest way to say
-        "ask again", and it is what keeps the second check alive.
+        A method rather than the same `with` block written inline, for the reason the old
+        `_ownership_is_gone` existed: mypy narrows `self.abandoned` to False after the check
+        at the top of `show` and calls every later test of it dead code. That is true of a
+        value only one thread can write, and false of this one.
         """
-        return self.abandoned
+        with self._keyboard:
+            if self.abandoned:
+                return False
+            self.shown = text
+            return True
+
+    def _still_ours(self, post: Callable[[Any], None], what: Any) -> bool:
+        """Post one keystroke, but only while the text is still ours — as ONE step.
+
+        Asking and then posting were two steps, and a key pressed in between was answered by
+        posting anyway. Rechecking before every keystroke narrowed that window to a single
+        press and could not close it: `disown` runs on the event tap's thread, so it can land
+        between the check and the post, and macOS then delivers the user's own key — moving
+        the caret, or focusing another window — before this backspace goes out. The backspace
+        then deletes a character stt did not type, which is the one thing this module exists
+        to prevent.
+
+        What the lock guarantees is that `disown` never lands BETWEEN the question and the
+        answer. It does not guarantee how long the tap's thread waits: `threading.Lock` is not
+        fair and permits barging, so on macOS — where CPython uses the condvar implementation
+        — the loop below can reacquire the lock before a woken `disown` gets it, and the tap's
+        thread then waits out the rest of the burst. That is still microseconds per event and
+        far inside what a tap callback may take, and the keystrokes it waits through only ever
+        remove characters stt itself typed, because they go out before the tap callback
+        returns and therefore before macOS delivers the user's key at all.
+        """
+        with self._keyboard:
+            if self.abandoned:
+                return False
+            post(what)
+            return True
 
     def disown(self) -> None:
         """The user typed or clicked. What is on screen is theirs now, whoever wrote it.
@@ -296,9 +343,15 @@ class Typist:
         stop that edit finishing. The user's character lands in the middle of ours rather
         than after them. Messy, and bounded: the backspaces only ever removed our own
         characters, and `abandoned` refuses every edit after that one.
+
+        What it DOES close is the smaller window inside that one. Taking the keyboard lock
+        means this cannot land between `show` asking whether the text is still ours and
+        posting the keystroke it asked about — the case where the user's own key reaches
+        macOS first and the keystroke that follows it deletes THEIR character.
         """
-        self.shown = ""
-        self.abandoned = True
+        with self._keyboard:
+            self.shown = ""
+            self.abandoned = True
 
     def settle(self) -> None:
         """The sentence is final. It stays on screen; it is simply no longer ours to edit.

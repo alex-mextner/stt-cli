@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import math
 import struct
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -453,6 +454,95 @@ async def test_both_models_load_at_once_and_neither_is_left_behind(monkeypatch) 
     with pytest.raises(RuntimeError):
         await dictation._load_together(Path("bin"), [Path("big"), Path("broken")], "ru", 0)
     assert stopped == ["big"], "the one that did start is not left holding memory"
+
+
+def test_a_key_arriving_between_the_check_and_the_press_cannot_delete_it() -> None:
+    """The check and the keystroke used to be two steps, and the gap between them belonged to
+    another thread.
+
+    `disown` runs on the event tap's thread, so it could land after `show` had asked whether
+    the text was still ours and before the backspace went out. macOS delivers the user's own
+    key first — moving the caret, or focusing another window — and the backspace that follows
+    then deletes a character stt did not type. Rechecking before every press narrowed the
+    window to one keystroke; only holding the same lock closes it.
+    """
+    typist = Typist(keys=FakeKeyboard())
+    typist.begin()
+    typist.show("раз два три")
+
+    tap_threads: list[threading.Thread] = []
+    blocked_while_posting: list[bool] = []
+
+    class WatchedKeyboard:
+        """Lets the tap's thread try to take over from inside a keystroke, and records
+        whether it managed to."""
+
+        def __init__(self) -> None:
+            self.presses = 0
+
+        def press_backspace(self, times: int) -> None:
+            self.presses += times
+            if self.presses == 1:
+                taking_over = threading.Thread(target=typist.disown)
+                taking_over.start()
+                taking_over.join(timeout=0.25)
+                # Still alive means it is waiting on the lock this keystroke holds, which is
+                # the whole guarantee: the user's key cannot be delivered between the check
+                # and the press.
+                blocked_while_posting.append(taking_over.is_alive())
+                tap_threads.append(taking_over)
+
+        def type_text(self, text: str) -> None: ...
+
+    watched = WatchedKeyboard()
+    typist.keys = watched
+    typist.show("раз")
+    for thread in tap_threads:
+        thread.join(timeout=2.0)
+
+    assert blocked_while_posting == [True], "disown could not land inside a keystroke"
+    assert typist.abandoned, "and it took effect once the keystrokes were done"
+    # NOT `presses == 1`. `threading.Lock` is not fair and permits barging, so the loop can
+    # reacquire the lock ahead of the woken `disown` and post the rest of the burst first —
+    # likeliest on macOS, where CPython uses the condvar implementation, which is exactly the
+    # platform this module targets. Asserting one press would have been a test that fails at
+    # random on the only machine it matters on. What is actually guaranteed, and what this
+    # checks, is that no keystroke goes out AFTER the takeover has been recorded.
+    assert watched.presses >= 1
+    before = watched.presses
+    typist.show("раз два")
+    assert watched.presses == before, "nothing more is posted once the text is not ours"
+
+
+def test_a_subdivision_flag_is_one_press_of_backspace() -> None:
+    """The England flag is a black flag, five tag letters and a terminator. The rule about
+    formatting characters did not reach the FIRST tag letter — what precedes it is the flag —
+    so this counted two, and a field that deletes it with one press was sent two: the second
+    came out of whatever was in front of it.
+
+    The second half of this test is the mistake the first half invited: making tag characters
+    join is not enough, because the terminator is a formatting character too, so everything
+    after a flag glued itself onto it. Two flags counted as one.
+    """
+    from stt_cli.live.typist import _clusters
+
+    england = "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f"
+    assert _clusters(england) == 1, "one flag, one press"
+    assert _clusters(england * 2) == 2, "and a tag sequence ends at its terminator"
+    assert _clusters(england + "a") == 2, "so a letter after a flag is its own character"
+    assert _clusters("\U0001f1f7\U0001f1fa\U0001f1ec\U0001f1e7") == 2, "regional pairs still"
+
+
+def test_a_number_too_big_for_a_float_is_refused_not_raised() -> None:
+    """Centralising the finiteness check created a way to crash that neither copy it replaced
+    had: `int()` accepts a 309-digit value and `math.isfinite` converts to float to answer,
+    which raises. `stt config set threads <that>` produced a traceback where a diagnosed
+    usage error was promised."""
+    from stt_cli import config
+
+    enormous = "9" * 309
+    assert config.coerce("threads", enormous) == int(enormous), "an int is finite by nature"
+    assert config.coerce("mic_threshold", "1500") == 1500.0, "and floats are still checked"
 
 
 def test_the_cue_starts_and_ends_at_silence_and_is_over_quickly() -> None:

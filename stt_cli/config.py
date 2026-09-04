@@ -317,6 +317,12 @@ def _refuse_a_number_that_is_not_one(key: str, number: float) -> None:
     """
     from ._errors import UsageError
 
+    # An `int` is finite by construction, and asking `math.isfinite` about a very large one
+    # RAISES: it converts to float first, so `stt config set threads <309 digits>` answered a
+    # promised usage error with an `OverflowError` traceback. Centralising the check created
+    # a way to crash that neither of the copies it replaced had.
+    if isinstance(number, int):
+        return
     if not math.isfinite(number):
         raise UsageError(
             what=f"{key} must be an ordinary number",
