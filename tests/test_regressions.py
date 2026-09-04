@@ -7,6 +7,8 @@ than a careful reader, so they get one apiece with the failing scenario in the n
 
 from __future__ import annotations
 
+import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -316,3 +318,157 @@ def test_two_writers_in_one_process_do_not_take_each_others_temporary(tmp_path) 
     assert not errors, f"a concurrent writer failed: {errors}"
     assert target.read_text("utf-8") in {"first", "second"}, "and never a blend of the two"
     assert list(tmp_path.glob("*.part")) == [], "no temporary is left behind"
+
+
+async def test_the_hugging_face_token_never_reaches_a_command_line(monkeypatch) -> None:
+    """A command line is public. Any user on the machine can read another process's argv out
+    of `ps`, and diarizing an hour of audio keeps the process alive long enough to be caught
+    — so the gated-model credential travels in the environment instead.
+
+    This is a regression test in the strict sense: the token used to stay in-process, the
+    split into a worker subprocess moved it onto argv, and review caught it there.
+    """
+    from stt_cli import diarize, proc
+
+    seen: dict[str, object] = {}
+
+    async def remember(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["env"] = kwargs.get("env")
+        return proc.Result(code=0, stdout='{"turns": []}', stderr="", argv=list(argv))
+
+    monkeypatch.setattr(diarize, "runner", lambda: ["/usr/bin/python3"])
+    monkeypatch.setattr(diarize, "require_token", lambda: "hf_secret_value")
+    monkeypatch.setattr(proc, "run", remember)
+
+    await diarize.diarize(Path("/tmp/whatever.wav"), speakers=2)
+
+    assert "hf_secret_value" not in " ".join(seen["argv"]), "not on the command line"
+    assert seen["env"] == {"HUGGING_FACE_HUB_TOKEN": "hf_secret_value"}, "in the environment"
+    assert "--speakers" in seen["argv"], "and the harmless arguments still travel as arguments"
+
+
+async def test_asking_whether_diarization_is_ready_never_downloads_anything(monkeypatch) -> None:
+    """`stt doctor` and `stt diarize status` are what people run when they want no surprises.
+    Checking readiness with a bare `uv run --with` would have resolved and downloaded two and
+    a half gigabytes to answer the question, so the probe is forbidden the network."""
+    from stt_cli import diarize, proc
+
+    asked: list[list[str]] = []
+
+    async def remember(argv, **kwargs):
+        asked.append(list(argv))
+        return proc.Result(code=0, stdout='{"ready": true}', stderr="", argv=list(argv))
+
+    monkeypatch.setattr(
+        diarize, "runner", lambda: ["/opt/uv", "run", "--quiet", "--with", "x", "python"]
+    )
+    monkeypatch.setattr(proc, "run", remember)
+
+    assert await diarize.ready() is True
+    assert "--offline" in asked[0], "the probe may look, not fetch"
+
+
+async def test_a_status_check_that_fails_reports_rather_than_raises(monkeypatch) -> None:
+    """The docstring promises it never raises, and only the diagnosed errors were caught: a
+    timeout from the probe would have come out of `stt doctor` as the traceback that command
+    exists to replace."""
+    from stt_cli import diarize, proc
+
+    async def time_out(argv, **kwargs):
+        raise TimeoutError("the probe never came back")
+
+    monkeypatch.setattr(diarize, "runner", lambda: ["/opt/uv", "run", "--quiet", "python"])
+    monkeypatch.setattr(proc, "run", time_out)
+
+    assert await diarize.ready() is False
+
+
+async def test_the_worker_inherits_the_environment_it_needs(monkeypatch, tmp_path) -> None:
+    """Passing the token in the environment only works if the environment is MERGED.
+
+    A reviewer could not rule out that `proc.run` replaces it instead — and replacing would
+    leave the worker with no HOME, so uv could not find its cache and huggingface could not
+    find `~/.cache/huggingface`. The token would be delivered perfectly to a process unable
+    to use it, status and doctor would stay green, and only real diarization would break.
+
+    So this runs an actual subprocess rather than asserting on what was handed to a mock.
+    """
+    from stt_cli import proc
+
+    script = tmp_path / "say.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "json.dump({'token': os.environ.get('HUGGING_FACE_HUB_TOKEN'),\n"
+        "           'home': bool(os.environ.get('HOME'))}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    result = await proc.run(
+        [sys.executable, str(script)], env={"HUGGING_FACE_HUB_TOKEN": "hf_secret_value"}
+    )
+    said = json.loads(result.stdout)
+
+    assert said["token"] == "hf_secret_value", "the secret arrived"
+    assert said["home"] is True, "and it did not arrive INSTEAD of the environment"
+
+
+def test_a_result_survives_anything_printed_after_it() -> None:
+    """torch and pyannote are other people's programs and may say something on their way out.
+    Taking the last line would throw away an hour of finished work over a shutdown warning."""
+    from stt_cli.diarize import _the_object_among
+
+    assert _the_object_among('{"turns": []}') == {"turns": []}
+    assert _the_object_among('resolving\n{"turns": [1]}\n') == {"turns": [1]}
+    assert _the_object_among('{"turns": [2]}\nWarning: leaked semaphore\n') == {"turns": [2]}
+    assert _the_object_among("nothing here\nnor here\n") is None
+    assert _the_object_among("") is None
+    assert _the_object_among("[1, 2, 3]\n") is None, "an array is not the worker's answer"
+
+
+async def test_diarization_that_runs_too_long_says_so_rather_than_crashing(
+    monkeypatch, tmp_path
+) -> None:
+    """The timeout was introduced by the move to a worker, and was the one failure in that
+    function not turned into a sentence — so the longest-running command in the tool ended an
+    hour of somebody's time with a stack trace."""
+    from stt_cli import diarize, proc
+    from stt_cli._errors import EngineError
+
+    async def never_finishes(argv, **kwargs):
+        raise TimeoutError("still going")
+
+    audio = tmp_path / "long.wav"
+    audio.write_bytes(b"\x00" * 32_000)
+    monkeypatch.setattr(diarize, "runner", lambda: ["/usr/bin/python3"])
+    monkeypatch.setattr(diarize, "require_token", lambda: "hf_x")
+    monkeypatch.setattr(proc, "run", never_finishes)
+
+    with pytest.raises(EngineError) as refused:
+        await diarize.diarize(audio)
+    assert "did not finish" in refused.value.what
+    assert "minutes" in refused.value.why, "and it says how long it waited"
+
+
+def test_the_diarization_budget_follows_the_length_of_the_recording(tmp_path) -> None:
+    """One fixed hour was wrong at both ends: long enough to sit on a wedged two-minute memo,
+    and short enough to cut off a three-hour recording that used to finish, because the
+    in-process call it replaced had no limit at all."""
+    from stt_cli.diarize import MINIMUM_TIMEOUT, _long_enough_for
+
+    # Under ninety seconds, twenty times the audio is less than the floor, and the floor is
+    # what covers the model download on a first run.
+    memo = tmp_path / "memo.wav"
+    memo.write_bytes(b"\x00" * (32_000 * 30))  # half a minute
+    assert _long_enough_for(memo) == MINIMUM_TIMEOUT, "short audio gets the floor"
+
+    quarter_hour = tmp_path / "meeting.wav"
+    quarter_hour.write_bytes(b"\x00" * (32_000 * 900))
+    assert _long_enough_for(quarter_hour) == 900 * 20, "past that, it follows the audio"
+
+    afternoon = tmp_path / "afternoon.wav"
+    afternoon.write_bytes(b"\x00" * (32_000 * 3 * 3600))  # three hours
+    assert _long_enough_for(afternoon) > 3 * 3600, "and a long one gets more than its length"
+
+    assert _long_enough_for(tmp_path / "gone.wav") == MINIMUM_TIMEOUT, (
+        "a missing file is not a crash"
+    )

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from stt_cli._errors import EXIT_MISSING_DEP, EXIT_OK
+from stt_cli._errors import EXIT_MISSING_DEP, EXIT_OK, EXIT_PERMISSION
 from stt_cli.cli import _discover, main
 
 
@@ -46,8 +46,20 @@ def test_every_command_module_exposes_the_contract() -> None:
     ],
 )
 def test_read_only_commands_run(argv: list[str]) -> None:
-    """A missing optional dependency is a reported exit code, never a traceback."""
-    assert main(argv) in {EXIT_OK, EXIT_MISSING_DEP}
+    """A missing optional dependency is a reported exit code, never a traceback.
+
+    Three codes, not two, and which one comes back is a property of the MACHINE rather than
+    of the command: `stt diarize status` answers "not ready" where the wheels are absent and
+    "ready, but no token" where they are cached, and both are correct reports of a real
+    state. The claim being made here is that none of them is an exception.
+    """
+    # The third code is allowed for diarization ALONE. Widening it for every command would
+    # have made this quietly accept "you are not signed in" from `stt config list`, which
+    # would be a defect rather than a state.
+    allowed = {EXIT_OK, EXIT_MISSING_DEP}
+    if argv[0] == "diarize":
+        allowed.add(EXIT_PERMISSION)
+    assert main(argv) in allowed
 
 
 @pytest.mark.parametrize(
