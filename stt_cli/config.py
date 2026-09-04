@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import stat
 from collections.abc import Iterator
@@ -107,6 +108,12 @@ class Settings:
     # person who typed `--context-compare off`, which is why the two are not the same fact.
     # Never configurable and never in the cache key: what gets keyed is the mode it settles.
     context_compare_chosen: bool = False
+
+    # live dictation
+    # How loud a frame must be before `stt mic` treats it as speech, whatever the room is
+    # doing. Zero means the detector's own default. Raise it in a room where stray noises get
+    # typed; lower it if a quiet voice goes unheard. `stt mic --check` reports both numbers.
+    mic_threshold: float = 0.0
 
     # voice activity detection
     vad: str = "auto"  # auto | silero | ffmpeg | none
@@ -280,14 +287,63 @@ def coerce(key: str, raw: str) -> Any:
     for name, caster in (("int", int), ("float", float)):
         if name in declared:
             try:
-                return caster(raw)
+                number = caster(raw)
             except ValueError as exc:
                 raise UsageError(
                     what=f"{key} is a {name} setting",
                     why=f"{raw!r} is not a {name}",
                     how=f"pass a number, e.g. `stt config set {key} 2`",
                 ) from exc
+            _refuse_a_number_that_is_not_one(key, number)
+            return number
     return raw
+
+
+def _refuse_a_number_that_is_not_one(key: str, number: float) -> None:
+    """`float("inf")` and `float("nan")` are numbers to Python and to nobody else.
+
+    The same hole was found and closed once already, in `--idle-minutes`: `nan` compares
+    false against everything and `inf` compares false against everything finite, so either
+    one switches off whatever it is a threshold for — silently, since nothing raises. Here it
+    would be `mic_threshold`: `stt config set mic_threshold inf` leaves the microphone open,
+    the detector never opening, nothing typed, and `--check` reporting a perfectly loud voice
+    as too quiet. Closing it in one place rather than per setting, because the next threshold
+    somebody adds will have exactly the same hole.
+
+    Only finiteness. Whether a NEGATIVE value makes sense is a question about the particular
+    setting — `-1` is nonsense for a threshold and nonsense for a repetition count, but this
+    function knows nothing about either, and an earlier version answered it here with a
+    sentence about microphone levels that `stt config set max_repeats -1` then printed.
+    """
+    from ._errors import UsageError
+
+    # An `int` is finite by construction, and asking `math.isfinite` about a very large one
+    # RAISES: it converts to float first, so `stt config set threads <309 digits>` answered a
+    # promised usage error with an `OverflowError` traceback. Centralising the check created
+    # a way to crash that neither of the copies it replaced had.
+    if isinstance(number, int):
+        return
+    if not math.isfinite(number):
+        raise UsageError(
+            what=f"{key} must be an ordinary number",
+            why=f"{number!r} compares false against every real measurement, so it would "
+            "switch off whatever it is a threshold for without saying so",
+            how=f"pass a finite number, e.g. `stt config set {key} 1500`",
+        )
+
+
+def _a_real_number(value: Any) -> bool:
+    """A float a measurement can be compared against — so not a bool, and not `Infinity`.
+
+    JSON has no infinity, but Python's `json` reads the bare words `Infinity` and `NaN`
+    anyway, so a hand-edited config can carry one into a threshold. This is the same question
+    `_refuse_a_number_that_is_not_one` asks of a value typed at the command line, and the two
+    paths have to agree: one of them accepting what the other refuses is how a setting ends
+    up rejected when set and honoured when hand-edited.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _validate(raw: dict[str, Any]) -> None:
@@ -308,14 +364,26 @@ def _validate(raw: dict[str, Any]) -> None:
             if "list" in declared
             else isinstance(value, int) and not isinstance(value, bool)
             if "int" in declared
-            else isinstance(value, (int, float)) and not isinstance(value, bool)
+            else _a_real_number(value)
             if "float" in declared
             else value is None or isinstance(value, str)
         )
         if not ok:
+            # A non-finite float is not a type error, and saying "expected float, found
+            # float (nan)" contradicts itself. It is a real number that is not a real
+            # measurement, and the sentence has to say which of the two went wrong.
+            if isinstance(value, float) and not _a_real_number(value):
+                what = f"{key} in {config_path()} is not a number anything can be compared to"
+                why = (
+                    f"{value!r} compares false against every real measurement, so it would "
+                    "switch off whatever it is a threshold for without saying so"
+                )
+            else:
+                what = f"{key} in {config_path()} has the wrong type"
+                why = f"expected {declared}, found {type(value).__name__} ({value!r})"
             raise UsageError(
-                what=f"{key} in {config_path()} has the wrong type",
-                why=f"expected {declared}, found {type(value).__name__} ({value!r})",
+                what=what,
+                why=why,
                 how=f"fix it, or run `stt config set {key} <value>` to write a valid one",
             )
 

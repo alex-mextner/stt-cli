@@ -342,6 +342,17 @@ def _resolve_root(explicit: str | None) -> Path | None:
     return None
 
 
+def server_binary(root: str | None = None) -> Path | None:
+    """The `whisper-server` binary from the same build as `whisper-cli`, if there is one.
+
+    Live dictation needs a model that stays loaded between questions, which the one-shot CLI
+    cannot give it. Both binaries come out of the same whisper.cpp build, so this looks in
+    the same places `whisper-cli` is looked for — but they are packaged separately often
+    enough that finding one says nothing about the other.
+    """
+    return _find_binary("whisper-server", _resolve_root(root))
+
+
 def _find_binary(name: str, root: Path | None) -> Path | None:
     if root:
         for relative in (Path("build") / "bin" / name, Path("bin") / name, Path(name)):

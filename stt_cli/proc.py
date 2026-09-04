@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import os
 import shutil
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,6 +114,51 @@ async def run(
             how="re-run with -v to see the full command and output",
         )
     return result
+
+
+async def drain_stderr(process: asyncio.subprocess.Process, into: deque[str]) -> None:
+    """Read what a child says on stderr for as long as it says anything, keeping the last few.
+
+    Draining is not optional bookkeeping. A pipe nobody reads fills up and then blocks the
+    writer, so a child that has plenty to say stops mid-work with no error anywhere — which
+    is how a speech model would answer a few hundred sentences and then simply stop. The
+    lines are kept in a bounded deque because the only ones worth having are the last ones,
+    said on the way out.
+
+    Written once here rather than once per child: the microphone and each speech model had
+    the same ten lines, and `end` was extracted to this module for the same reason.
+    """
+    assert process.stderr is not None
+    while True:
+        line = await process.stderr.readline()
+        if not line:
+            return
+        said = line.decode("utf-8", "replace").strip()
+        if said:
+            into.append(said)
+
+
+async def end(process: asyncio.subprocess.Process, *, grace: float) -> None:
+    """Ask a child to stop, and insist if it will not.
+
+    The same six lines were written twice — once for the microphone and once for each speech
+    model — with different grace periods and one of them able to drift from the other. What
+    they share is the shape and every one of its edge cases: a child that has already exited
+    (nothing to do), one that exits between the check and the signal (`ProcessLookupError`,
+    which is success, not failure), and one that ignores `SIGTERM` (killed, and then WAITED
+    for — an unreaped child is a zombie, and dictation starts and stops these all day).
+    """
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:  # pragma: no cover - it exited between the check and here
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace)
+    except TimeoutError:  # pragma: no cover - a child ignoring a TERM
+        _terminate(process)
+        await process.wait()
 
 
 def _terminate(proc: asyncio.subprocess.Process) -> None:
