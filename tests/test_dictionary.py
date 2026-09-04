@@ -428,7 +428,15 @@ def test_check_refuses_a_threshold_the_pipeline_would_refuse(bad, capsys) -> Non
     config.config_path().write_text(f'{{"dict_similarity": {bad}}}', "utf-8")
 
     assert main(["dict", "check", "Colocka"]) == EXIT_USAGE
-    assert "dict_similarity must be between 0 and 1" in capsys.readouterr().err
+    said = capsys.readouterr().err
+    # `NaN` is refused a step earlier and for a different reason: it is not out of range, it
+    # is a value no range can contain, and it would silently switch the threshold off.
+    expected = (
+        "is not a number anything can be compared to"
+        if bad == "NaN"
+        else "dict_similarity must be between 0 and 1"
+    )
+    assert expected in said
 
 
 def test_a_second_opinion_does_not_resurrect_a_spelling_the_user_wrote_down() -> None:

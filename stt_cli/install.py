@@ -48,6 +48,7 @@ stt call.ogg -t absolute --tz Europe/Belgrade   # wall-clock timestamps
 stt meeting.m4a --summary --fix -f md    # LLM-corrected transcript + structured summary
 stt meeting.m4a --diarize -f speakers    # split into speaker turns
 stt dict add ConLoca --aka ConLog        # terms the model does not know
+stt mic                                  # live dictation into the focused window
 stt archive ls                           # everything transcribed so far
 stt archive show <run-id> -f vtt         # re-render an old run, no GPU needed
 ```
@@ -72,6 +73,9 @@ stt archive show <run-id> -f vtt         # re-render an old run, no GPU needed
 - `--fix` and `--summary` borrow an installed agent CLI (codex / claude / opencode); no API
   key of their own.
 - Runs are cached in a local archive, so re-rendering a different format is instant.
+- `stt mic` is for the HUMAN to run, not for you. It types into whatever window has focus
+  and runs until they stop it, so starting one on their behalf puts text somewhere neither of
+  you can see. Tell them the command; do not run it.
 - `stt doctor` reports every dependency and how to install the missing ones.
 """
 

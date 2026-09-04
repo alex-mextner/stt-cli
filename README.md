@@ -210,6 +210,70 @@ archive says what was actually decoded; with the comparison on (which is what `-
 on) it stays `off`, because the two modes then differ in what the second pass decodes
 against and collapsing them would serve one for the other.
 
+## Dictating live
+
+```bash
+stt mic                          # speak; the words appear where you are already typing
+stt mic --check                  # is it hearing you? levels, the bar, and the verdict
+stt mic --list-devices           # which microphone is which
+stt mic --no-draft               # nothing is typed until it is final
+stt mic --model medium           # settle faster, at some cost in accuracy
+stt mic --draft-model small      # a better first guess, if the machine can afford it
+```
+
+`stt mic` opens the microphone and types what you say into whatever window has focus. Two
+models run at once, and what you actually see is this: the first words appear about a second
+and a half after you start talking and keep up with you from there, and one to three seconds
+after you stop they are replaced by a better version of the same sentence — the one with the
+proper nouns, the capitals and the punctuation right.
+
+Underneath, the small model decodes the sentence so far in about forty milliseconds and is
+asked again every six-tenths of a second; the wait is the pause the sentence has to end with
+before `large-v3-turbo` is given the whole of it. Your terminology dictionary reaches both,
+so a project name is spelled the way you wrote it down rather than four different ways.
+
+Press any key yourself and stt stops correcting the sentence in flight and leaves it exactly
+where it is — it will never delete a character it did not type. Two presses of Escape end the
+session, as does Ctrl-C in the terminal, and the whole transcript is printed when it does. A
+session nobody has spoken into for half an hour ends on its own, because a microphone left
+open is a room being recorded; `--idle-minutes` changes that, and `--idle-minutes 0` turns it
+off. A second `stt mic` refuses to start while one is running: two of them would type into
+the same window and each would delete what it believed it wrote.
+
+It needs two permissions, both granted to the terminal application rather than to stt,
+because that is the level macOS grants them at: **Accessibility**, to type at all, and
+**Microphone**, the first time it records.
+
+`stt mic --check` is what to run when dictation appears to do nothing, which is a real way
+for it to fail: if every frame the microphone delivers is below the bar the detector sets,
+there is no text, no error and no exit code. It opens the microphone, draws what it hears
+against that bar, and says which it was — a permission never granted, the wrong device open,
+a voice too quiet, or a room being mistaken for one. It types nothing anywhere. If it reports
+that stray noises are loud enough to count, `stt config set mic_threshold <n>` raises the bar;
+the check prints the numbers to choose from.
+
+It also needs the `whisper-server` binary, which comes from the same whisper.cpp build as
+`whisper-cli` — and it uses whisper.cpp whatever engine you have configured for files,
+because MLX has no way to keep a model loaded between questions and loading one per sentence
+costs more than the entire latency budget.
+
+**How it tells you what it is doing.** The terminal you started it from shows a live status
+line — what is being heard, and whether it has settled. A short system sound and a
+notification mark the microphone opening and closing, for when that terminal is behind
+another window, which it usually is. `-q` turns all three off.
+
+There is no menu bar icon: that needs an `NSApplication` event loop running inside the
+process, which is a lot of machinery for a small thing. The notifications come from
+`osascript`, which every Mac already has, so the banner is attributed to Script Editor rather
+than to stt — the honest cost of not being an application.
+
+There is also no underline under the provisional text, the way Apple's own dictation marks
+what it has not decided yet. Only an input method can do that — marked text is drawn by the
+receiving application's text system, and an input method is a separate installed app bundle
+rather than a command. So provisional text here looks like ordinary typed text and is
+corrected underneath you. If you would rather never see a wrong word at all, `--no-draft`
+types nothing until it is final.
+
 ## Archive
 
 ```bash

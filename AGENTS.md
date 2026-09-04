@@ -32,6 +32,69 @@ async. Zero required third-party runtime dependencies.
 | `formats.py`, `timestamps.py` | renderers and the three timestamp modes |
 | `registry.py` | the model pool: one human name per model, per-engine ids, sizes |
 | `resources.py` | disk and memory guards before any large download or write |
+| `live/` | `stt mic`: microphone, gate, two persistent models, and the keyboard |
+
+## Live dictation (`live/`)
+
+`stt mic` is the one part of the tool that writes outside its own process, so it has
+invariants of its own on top of the ones below.
+
+| module | what it is |
+| --- | --- |
+| `quartz.py`, `tap.py` | the four macOS calls, through `ctypes`: type, backspace, watch, ask |
+| `capture.py` | the microphone as PCM, via the ffmpeg that is already required |
+| `gate.py` | where one utterance ends, so silence never reaches a model |
+| `server.py` | a `whisper-server` process: a model that stays loaded between questions |
+| `typist.py` | what is on screen, what is ours, and the smallest edit between the two |
+| `session.py` | the two-speed loop; `dictation.py` wires it up, `status.py` reports |
+
+- **stt deletes only characters stt typed, and only while it still owns them.** Ownership
+  ends the instant the user presses a key or clicks — see `Typist.disown`, which deliberately
+  neither tidies the half-finished draft nor appends the finished sentence after it.
+- **One writer, and it is the event loop.** The draft pass and the accurate pass write to the
+  same caret. Typing was on a thread until it was measured — two hundred backspaces cost
+  three milliseconds — and a thread meant two writes could interleave, with the cancel that
+  was supposed to prevent it unable to stop a thread it had only cancelled the await of.
+  `Session._put` is synchronous, and that is what makes one-at-a-time a guarantee.
+- **The draft pass and the accurate pass never overlap.** They decode different audio; if
+  their answers could arrive in either order the text would assemble itself backwards.
+  Drafting stops while a sentence settles, and a sentence starting during that must not make
+  the typist forget what is on screen — see `Typist.begin`.
+- **A key code never leaves `tap.py` for anything but a comparison.** A system-wide key-down
+  tap is a keylogger with a different name, and the only defence that holds is that nothing
+  writes one to a log, a file or the archive.
+- **Never call `quartz.type_text` or `press_backspace` outside `stt mic` without first
+  focusing a throwaway document.** They type into the frontmost window of whoever is at the
+  machine; the per-session marker only tells our own tap to ignore them. A benchmark of the
+  posting cost once went into a browser window somebody was reading. Everything about WHAT
+  gets typed is testable through `typist.py` and a fake keyboard, which is where it belongs.
+- **Silence is never handed to a model, and the thresholds come from measurements.**
+  `gate.py` is what `vad.py` is for a file, and it matters more here: an invented sentence in
+  a file is a line to delete, and an invented sentence here is typed into somebody's window.
+  The numbers in it were taken from recordings of this machine's own microphone — a quiet
+  room at a median RMS of 16 with transients to 1014, speech at 4550 — and re-tuning them
+  means re-measuring, not guessing. `live/meter.py` is how you re-measure: it runs the real
+  capture through the real gate and prints levels, and `stt mic --check` is that module with
+  a terminal attached. Note what the measurements say about the limit of the approach: a
+  keystroke reaches 1014 and a quiet voice 812, so LEVEL alone cannot separate them and
+  duration has to. `THRESHOLD_MINIMUM` (the bar a frame must clear) and `FLOOR_MINIMUM` (a
+  clamp that only keeps the learned floor off exact zero) are deliberately two constants —
+  they were one, and the single name put the effective bar at six times its documented value.
+- **One session at a time, and it ends by itself.** Two `stt mic` processes type into the
+  same window and each deletes what IT believes it wrote, which is by then interleaved with
+  the other's — an exclusive lock in `dictation._the_only_session` refuses the second, before
+  it loads a model rather than after. And a session nobody has spoken into for half an hour
+  stops: a microphone left open is a room being recorded, and the clicks an empty room makes
+  do not count as somebody speaking (see `Session._end`).
+- **Nothing that holds a resource is left holding it.** Two models in memory, a recording
+  light, a system-wide event tap and a lock file, all released on every path out including a
+  server that never became ready. Both subprocesses have their output drained continuously,
+  because a pipe nobody reads fills up and then blocks the writer — the microphone or the
+  model stopping mid-session with nothing said anywhere.
+- **Two things that look like free wins and are not, both measured:** `audio_ctx` made
+  `large-v3-turbo` four times slower, and `no_speech_prob` answered 0.000 for room noise it
+  had just invented words out of. The notes are in `server.py`; do not reach for either
+  again without new measurements.
 
 ## Invariants
 
@@ -126,6 +189,19 @@ uv run --extra test pytest -q
 ```
 
 Tests must not need a model, a GPU or a network. Anything that would is mocked.
+
+**Check a fix by removing it and watching its test fail.** Five tests in `test_live.py` passed
+whether or not the code they named was there — they asserted on the machinery rather than on
+the path through it, which is the shape this mistake takes every time. A test that survives
+the deletion of its own fix is guarding nothing, and the only way to find out is to try.
+
+**Clear `__pycache__` before believing a result you are surprised by.** Python decides a
+cached `.pyc` is current from the source's size and mtime, and a rewrite that lands inside the
+same clock tick at the same size does not always invalidate it. That cost half an hour here:
+`inspect.getsource` showed the new code while the interpreter ran the old bytecode, so a test
+failed against a function whose source was plainly correct — and, worse, the mutation checks
+before it had been running against a mixture. `find . -name __pycache__ -not -path "./.venv/*"
+-exec rm -rf {} +` before a mutation run, and any time a result contradicts the file.
 
 ## Writing reports for people (Telegram, PR bodies, spec summaries)
 

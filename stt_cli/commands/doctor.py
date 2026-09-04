@@ -95,6 +95,58 @@ def _optional_section() -> None:
     )
     if not installed:
         print(f"      fix: {diarize.INSTALL_HINT}")
+    _dictation_line()
+
+
+def _dictation_line() -> None:
+    """Whether `stt mic` would work, without starting it.
+
+    Its two requirements fail in ways that are hard to read at the moment they fail: a
+    missing `whisper-server` looks like whisper.cpp being absent when `whisper-cli` is right
+    there, and a missing Accessibility grant looks like a keyboard that types nothing at all.
+    Both are worth answering here rather than by trying it and wondering.
+    """
+    from .. import config
+
+    # The configured checkout, the way `stt mic` asks. Without it, somebody whose whisper.cpp
+    # lives where they told stt about it was shown "NOT found" and an install instruction for
+    # something they had already installed.
+    #
+    # Reading the config is allowed to FAIL here. `stt doctor` is the command somebody runs
+    # because their setup is broken, and a hand-edited config.json is one of the ways it can
+    # be; letting that diagnosed error out stopped the report at this line, so the storage
+    # section and the summary never printed for the one command whose job is to say what is
+    # wrong. A config that cannot be read is reported as a line, not as the end of the report.
+    from .._errors import SttError
+    from ..backends import whispercpp
+    from ..live import quartz
+
+    try:
+        root = config.load_settings().whispercpp_root
+    except SttError as unreadable:
+        print(f"  {_mark(False)} live dictation (`stt mic`): config unreadable")
+        print(f"      fix: {unreadable.how}")
+        return
+    server = whispercpp.server_binary(root)
+    granted = quartz.trusted()
+    print(
+        f"  {_mark(bool(server) and granted)} live dictation (`stt mic`): "
+        f"whisper-server {'found' if server else 'NOT found'}, "
+        f"Accessibility {'granted' if granted else 'NOT granted'}"
+    )
+    if not server:
+        # The whisper-server-specific text, not the generic whisper.cpp one. They are two
+        # hints for one failure, and the generic one never names `whisper-server` — so the
+        # report told somebody to install something they already had, without mentioning
+        # that the packaged build may not carry the binary `stt mic` needs.
+        from ..live.dictation import SERVER_HINT
+
+        print(f"      fix: {SERVER_HINT}")
+    if not granted:
+        print(
+            "      fix: grant Accessibility to your terminal in System Settings > "
+            "Privacy & Security, then start a new terminal"
+        )
 
 
 def _storage_section() -> None:
